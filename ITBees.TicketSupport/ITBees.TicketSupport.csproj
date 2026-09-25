@@ -1,10 +1,39 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-  </PropertyGroup>
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <PackageId>ITBees.TicketSupport</PackageId>
+        <Version>8.0.1</Version>
+        <Authors>ITBeesPL</Authors>
+        <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+        <Description>Reusable ticketing support desk for ITBees applications: tickets raised from a requester panel, conversation history worked from a desk panel, ratings and desk statistics.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="HtmlSanitizer" Version="9.2.1039" />
+        <PackageReference Include="ITBees.Interfaces" Version="8.0.72" />
+        <PackageReference Include="ITBees.Models" Version="8.0.95" />
+        <PackageReference Include="ITBees.RestfulApiControllers" Version="8.0.31" />
+        <PackageReference Include="ITBees.UserManager" Version="8.0.401" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.10" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.4" />
+    </ItemGroup>
+
+    <!--
+      Alerts comes from the feed, pinned to the version the first host (Octopark) already consumes.
+      A sibling ProjectReference would put a different assembly version next to the host's package
+      reference, and the host would then load two of them.
+    -->
+    <ItemGroup>
+        <PackageReference Include="ITBees.Alerts" Version="8.0.4" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+            <_Parameter1>ITBees.TicketSupport.Tests</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
 
 </Project>
