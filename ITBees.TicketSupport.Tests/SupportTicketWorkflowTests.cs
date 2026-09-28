@@ -33,6 +33,28 @@ public class SupportTicketWorkflowTests
     private SupportTicketRequesterClosureService _closureService = null!;
     private SupportTicketStatisticsService _statistics = null!;
     private CurrentUser _requester = null!;
+    private SupportTicketWriter _writer = null!;
+    private SupportTicketViewMapper _mapper = null!;
+    private SupportTicketRequesterAccess _requesterAccess = null!;
+    private readonly List<InMemorySupportTicketRateLimiter> _rateLimiters = new();
+
+    [TearDown]
+    public void TearDown()
+    {
+        _rateLimiters.ForEach(x => x.Dispose());
+        _rateLimiters.Clear();
+    }
+
+    private InMemorySupportTicketRateLimiter Limiter(SupportTicketRateLimitConfiguration rateLimits)
+    {
+        var limiter = new InMemorySupportTicketRateLimiter(new SupportTicketConfiguration { RateLimits = rateLimits });
+        _rateLimiters.Add(limiter);
+        return limiter;
+    }
+
+    private SupportTicketService NewService(ISupportTicketRateLimiter rateLimiter) =>
+        new(_tickets.Write.Object, _writer, _mapper, _desk.Object, _resolver.Object, _ratingService,
+            Mock.Of<ISupportTicketNotifier>(), _currentUser.Object, _requesterAccess, rateLimiter);
 
     [SetUp]
     public void Setup()
@@ -48,23 +70,23 @@ public class SupportTicketWorkflowTests
         contextAccess.Setup(x => x.CheckAccess(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
             .Returns((string type, Guid guid, bool _) => _contexts.FirstOrDefault(x => x.Type == type && x.Guid == guid)
                 ?? throw new FasApiErrorException("Context forbidden", 403));
-        var requesterAccess = new SupportTicketRequesterAccess(_currentUser.Object, contextAccess.Object);
+        var requesterAccess = _requesterAccess = new SupportTicketRequesterAccess(_currentUser.Object, contextAccess.Object);
         _desk.Setup(x => x.CheckDeskAccess()).Callback(() =>
         {
             if (!_desk.Object.IsDeskUser()) throw new FasApiErrorException("Forbidden", 403);
         });
         var resolver = _resolver = new Mock<ISupportTicketRequesterResolver>();
         resolver.Setup(x => x.ResolveNames(It.IsAny<IReadOnlyCollection<Guid>>())).Returns(new Dictionary<Guid, string>());
-        var writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
+        var writer = _writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
             _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
-        var mapper = new SupportTicketViewMapper(_messages.Read.Object, _attachments.Read.Object, _ratings.Read.Object,
+        var mapper = _mapper = new SupportTicketViewMapper(_messages.Read.Object, _attachments.Read.Object, _ratings.Read.Object,
             _events.Read.Object, resolver.Object);
         _ratingService = new SupportTicketRatingService(_ratings.Read.Object, _ratings.Write.Object,
             Mock.Of<ISupportTicketNotifier>(), writer, new SupportTicketConfiguration());
         _requesterRatingService = new SupportTicketRequesterRatingService(_tickets.Read.Object, _currentUser.Object,
             _ratingService, mapper, requesterAccess);
-        _service = new SupportTicketService(_tickets.Write.Object, writer, mapper, _desk.Object, resolver.Object,
-            _ratingService, Mock.Of<ISupportTicketNotifier>(), _currentUser.Object, requesterAccess);
+        // The default limits, which none of the workflow tests should come near.
+        _service = NewService(Limiter(new SupportTicketRateLimitConfiguration()));
         _query = new SupportTicketQueryService(_tickets.Read.Object, _events.Read.Object, _desk.Object,
             resolver.Object, mapper, _currentUser.Object, requesterAccess);
         _closureService = new SupportTicketRequesterClosureService(_tickets.Write.Object, writer, mapper, requesterAccess,
@@ -704,6 +726,103 @@ public class SupportTicketWorkflowTests
         _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
             { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Post-mortem", InternalNote = true });
         Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.Closed));
+    }
+
+    private static SupportTicketIm NewTicketIm(string message = "Brama nie działa") =>
+        new() { Subject = "Awaria", Message = message };
+
+    [Test]
+    public void RequesterIsStoppedAfterTheBurstOfNewTicketsTheDeskIsNot()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { NewTickets = new() { Burst = 2, Refill = 1, RefillPeriod = TimeSpan.FromHours(1) } }));
+        service.Create(NewTicketIm());
+        service.Create(NewTicketIm());
+
+        var refused = Assert.Throws<FasApiErrorException>(() => service.Create(NewTicketIm()));
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+            Assert.That(refused.FasApiErrorVm.ErrorKey, Is.EqualTo(InMemorySupportTicketRateLimiter.ErrorKey));
+            Assert.That(refused.Message, Does.Contain("Try again in 60 min"));
+            Assert.That(_tickets.Rows, Has.Count.EqualTo(2));
+        });
+
+        // Budgets are per requester, and the desk has none.
+        _requester = new CurrentUser { Guid = Guid.NewGuid(), Email = "coworker@example.test", DisplayName = "Coworker" };
+        service.Create(NewTicketIm());
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        for (var i = 0; i < 3; i++)
+            service.CreateFromDesk(NewTicketIm());
+        Assert.That(_tickets.Rows, Has.Count.EqualTo(6));
+    }
+
+    [Test]
+    public void RequesterAnswersAreLimitedTheDeskAnswersAreNot()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { Messages = new() { Burst = 2, Refill = 1, RefillPeriod = TimeSpan.FromMinutes(10) } }));
+        var ticket = service.Create(NewTicketIm());
+        var reply = new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" };
+        service.ReplyAsRequester(reply);
+        service.ReplyAsRequester(reply);
+
+        var refused = Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(reply));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(3));
+
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        for (var i = 0; i < 3; i++)
+            service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        Assert.That(_messages.Rows, Has.Count.EqualTo(6));
+    }
+
+    [Test]
+    public void ContentVolumeCountsNewTicketsAndAnswersTogether()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { ContentKilobytes = new() { Burst = 10, Refill = 10, RefillPeriod = TimeSpan.FromHours(1) } }));
+        var ticket = service.Create(NewTicketIm(new string('a', 6 * 1024)));
+
+        Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(new SupportTicketReplyIm
+            { SupportTicketGuid = ticket.Guid, Message = new string('b', 5 * 1024) }));
+        service.ReplyAsRequester(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = new string('c', 4 * 1024) });
+        Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void AMessageLargerThanTheWholeContentBudgetTakesAFullBucketInsteadOfFailing()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { ContentKilobytes = new() { Burst = 4, Refill = 4, RefillPeriod = TimeSpan.FromHours(1) } }));
+        var ticket = service.Create(NewTicketIm(new string('a', 6 * 1024)));
+        var refused = Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(new SupportTicketReplyIm
+            { SupportTicketGuid = ticket.Guid, Message = "Krótko" }));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+    }
+
+    [Test]
+    public void NullRateLimitsSwitchTheLimiterOff()
+    {
+        var service = NewService(Limiter(null!));
+        for (var i = 0; i < 30; i++)
+            service.Create(NewTicketIm());
+        Assert.That(_tickets.Rows, Has.Count.EqualTo(30));
+    }
+
+    [Test]
+    public void RateLimitNeedsPositiveValues() =>
+        Assert.Throws<ArgumentException>(() => Limiter(new SupportTicketRateLimitConfiguration
+            { Messages = new() { Burst = 0, Refill = 1, RefillPeriod = TimeSpan.FromMinutes(1) } }));
+
+    [Test]
+    public void TheRateLimiterIsOnePerProcess()
+    {
+        // A scoped limiter would start every request with full buckets and never refuse anything.
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        ITBees.TicketSupport.Setup.SupportTicketSetup.Register(services, new SupportTicketConfiguration());
+        Assert.That(services.Single(x => x.ServiceType == typeof(ISupportTicketRateLimiter)).Lifetime,
+            Is.EqualTo(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton));
     }
 
     private sealed class Store<T> where T : class

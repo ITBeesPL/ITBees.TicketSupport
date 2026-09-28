@@ -20,13 +20,16 @@ public class SupportTicketService : ISupportTicketService
     private readonly ISupportTicketNotifier _supportTicketNotifier;
     private readonly IAspCurrentUserService _aspCurrentUserService;
     private readonly SupportTicketRequesterAccess _supportTicketRequesterAccess;
+    private readonly ISupportTicketRateLimiter _supportTicketRateLimiter;
 
     public SupportTicketService(IWriteOnlyRepository<SupportTicket> supportTicketWoRepo,
         SupportTicketWriter supportTicketWriter, SupportTicketViewMapper supportTicketViewMapper,
         ISupportTicketDeskAccess supportTicketDeskAccess, ISupportTicketRequesterResolver supportTicketRequesterResolver,
         ISupportTicketRatingService supportTicketRatingService, ISupportTicketNotifier supportTicketNotifier,
-        IAspCurrentUserService aspCurrentUserService, SupportTicketRequesterAccess supportTicketRequesterAccess)
+        IAspCurrentUserService aspCurrentUserService, SupportTicketRequesterAccess supportTicketRequesterAccess,
+        ISupportTicketRateLimiter supportTicketRateLimiter)
     {
+        _supportTicketRateLimiter = supportTicketRateLimiter;
         _supportTicketWoRepo = supportTicketWoRepo;
         _supportTicketWriter = supportTicketWriter;
         _supportTicketViewMapper = supportTicketViewMapper;
@@ -52,6 +55,13 @@ public class SupportTicketService : ISupportTicketService
     {
         var currentUser = _aspCurrentUserService.GetCurrentUser();
         var requester = ResolveRequester(supportTicketIm, currentUser, fromDesk);
+
+        // Requesters only - the requester path has a signed-in user by now. Checked before the
+        // sanitizing and the writes, so a flood costs neither.
+        if (!fromDesk)
+            _supportTicketRateLimiter.CheckNewTicket(currentUser.Guid,
+                ContentLength(supportTicketIm.Message, supportTicketIm.MessageHtml));
+
         var context = _supportTicketRequesterAccess.CheckContext(supportTicketIm.ContextType,
             supportTicketIm.ContextGuid, true);
 
@@ -112,6 +122,10 @@ public class SupportTicketService : ISupportTicketService
         // one still reopens on the requester's answer - that is what Resolved waits for.
         if (supportTicket.Status == SupportTicketStatus.Closed)
             throw new FasApiErrorException("The ticket is closed", 409);
+
+        // Check above guarantees a signed-in user.
+        _supportTicketRateLimiter.CheckMessage(_aspCurrentUserService.GetCurrentUserGuid().Value,
+            ContentLength(supportTicketReplyIm.Message, supportTicketReplyIm.MessageHtml));
 
         var wasFinished = IsFinished(supportTicket);
         var message = _supportTicketWriter.AppendMessage(supportTicket, new SupportTicketMessageCommand
@@ -370,6 +384,10 @@ public class SupportTicketService : ISupportTicketService
 
     private static bool IsFinished(SupportTicket supportTicket) =>
         supportTicket.Status is SupportTicketStatus.Resolved or SupportTicketStatus.Closed;
+
+    /// <summary>What the message will weigh: the HTML when there is one, as SupportTicketRichText picks.</summary>
+    private static int ContentLength(string body, string html) =>
+        string.IsNullOrWhiteSpace(html) ? body?.Length ?? 0 : html.Length;
 
     private SupportTicketPerson ResolveRequester(SupportTicketIm supportTicketIm, CurrentUser currentUser,
         bool fromDesk)
