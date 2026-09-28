@@ -26,7 +26,16 @@ public class SupportTicketRequesterAccess
             throw new FasApiErrorException("Context type and identifier must be provided together", 400);
         if (_aspCurrentUserService.GetCurrentUserGuid() == null)
             throw new FasApiErrorException("Sign in to access shared tickets", 401);
-        return _supportTicketContextAccess.CheckAccess(contextType, contextGuid.Value, forWrite);
+
+        // The adapter is host code. Anything but the context that was asked for - null included - is a
+        // denial: Check below ignores the value, so a null would otherwise read as "allowed", and on
+        // create it would quietly turn a shared ticket into a private one.
+        var context = _supportTicketContextAccess.CheckAccess(contextType, contextGuid.Value, forWrite);
+        if (context == null || context.Guid != contextGuid.Value ||
+            !string.Equals(context.Type, contextType, StringComparison.OrdinalIgnoreCase))
+            throw new FasApiErrorException("You do not have access to this ticket context", 403);
+
+        return context;
     }
 
     public void Check(SupportTicket ticket, bool forWrite)

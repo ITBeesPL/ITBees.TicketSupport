@@ -471,6 +471,28 @@ public class SupportTicketWorkflowTests
     }
 
     [Test]
+    public void ContextAdapterAnsweringNullOrAnotherContextIsADenial()
+    {
+        var contextGuid = Guid.NewGuid();
+        var adapter = new Mock<ISupportTicketContextAccess>();
+        var access = new SupportTicketRequesterAccess(_currentUser.Object, adapter.Object);
+        var shared = new SupportTicket
+            { Guid = Guid.NewGuid(), ContextType = "parking", ContextGuid = contextGuid, RequesterGuid = Guid.NewGuid() };
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>())).Returns((SupportTicketContextVm)null!);
+        Assert.Throws<FasApiErrorException>(() => access.Check(shared, false));
+        Assert.Throws<FasApiErrorException>(() => access.CheckContext("parking", contextGuid, true));
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>()))
+            .Returns(new SupportTicketContextVm("parking", Guid.NewGuid(), "Another parking"));
+        Assert.Throws<FasApiErrorException>(() => access.Check(shared, false));
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>()))
+            .Returns(new SupportTicketContextVm("Parking", contextGuid, "Test parking"));
+        Assert.DoesNotThrow(() => access.Check(shared, true));
+    }
+
+    [Test]
     public void DefaultContextAdapterDeniesSharedTickets()
     {
         var adapter = new PrivateSupportTicketContextAccess();
