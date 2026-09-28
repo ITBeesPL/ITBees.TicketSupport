@@ -290,6 +290,30 @@ public class SupportTicketWorkflowTests
     private SupportTicketVm Create() => _service.Create(new SupportTicketIm { Subject = "Awaria", Message = "Brama nie działa" });
 
     [Test]
+    public void ListsCountPublicMessagesWithoutLoadingThem()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        _service.AddInternalNote(new SupportTicketNoteIm { SupportTicketGuid = ticket.Guid, Message = "Wewnętrzne" });
+        _messages.Read.Invocations.Clear();
+
+        var queue = _query.GetForDesk(new SupportTicketListFilter());
+        Assert.That(queue.Data.Single().MessageCount, Is.EqualTo(2));
+        _messages.Read.Verify(x => x.GetData(It.IsAny<Expression<Func<SupportTicketMessage, bool>>>(),
+            It.IsAny<Expression<Func<SupportTicketMessage, object>>[]>()), Times.Never);
+    }
+
+    [Test]
+    public void AHugePageNumberGivesAnEmptyPage()
+    {
+        Create();
+        var page = _query.GetMine(new SupportTicketListFilter { Page = int.MaxValue, PageSize = 200 });
+        Assert.That(page.AllElementsCount, Is.EqualTo(1));
+        Assert.That(page.Data, Is.Empty);
+    }
+
+    [Test]
     public void MysqlTimestampsAreSerializedAsUtc()
     {
         var vm = new SupportTicketVm(new SupportTicket { CreatedUtc = new DateTime(2026, 9, 3, 10, 0, 0) });
