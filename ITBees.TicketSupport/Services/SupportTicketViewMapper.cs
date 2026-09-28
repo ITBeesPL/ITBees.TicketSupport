@@ -97,6 +97,10 @@ public class SupportTicketViewMapper
             var messageVm = new SupportTicketMessageVm(x);
             if (string.IsNullOrWhiteSpace(messageVm.AuthorName) && x.AuthorGuid.HasValue)
                 messageVm.AuthorName = authorNames.GetValueOrDefault(x.AuthorGuid.Value);
+            // The address on a desk answer is the login of a support account; the requester side gets
+            // the name only.
+            if (!includeInternal && x.Direction != SupportTicketMessageDirection.Inbound)
+                messageVm.AuthorEmail = null;
             messageVm.Attachments = attachments
                 .Where(a => a.SupportTicketMessageGuid == x.Guid)
                 .Select(a => new SupportTicketAttachmentVm(a))

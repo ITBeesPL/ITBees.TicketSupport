@@ -176,6 +176,27 @@ public class SupportTicketWorkflowTests
     }
 
     [Test]
+    public void RequesterSeesTheNameButNotTheAddressOfTheSupportAccount()
+    {
+        var ticket = Create();
+        var requester = _requester;
+        _requester = new CurrentUser { Guid = Guid.NewGuid(), Email = "agent@example.test", DisplayName = "Agent" };
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        Assert.That(_query.GetDetails(ticket.Guid).Messages.Last().AuthorEmail, Is.EqualTo("agent@example.test"));
+
+        _requester = requester;
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        var messages = _query.GetDetails(ticket.Guid, true).Messages;
+        Assert.Multiple(() =>
+        {
+            Assert.That(messages.Last().AuthorName, Is.EqualTo("Agent"));
+            Assert.That(messages.Last().AuthorEmail, Is.Null);
+            Assert.That(messages.First().AuthorEmail, Is.EqualTo(requester.Email));
+        });
+    }
+
+    [Test]
     public void DeskReplyAndCloseAreRecordedOnceAndTheRequesterCannotAnswerAClosedTicket()
     {
         var ticket = Create();
