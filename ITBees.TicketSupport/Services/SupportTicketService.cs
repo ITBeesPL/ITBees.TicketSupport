@@ -97,6 +97,13 @@ public class SupportTicketService : ISupportTicketService
         var currentUser = _aspCurrentUserService.GetCurrentUser();
         _supportTicketRequesterAccess.Check(supportTicket, true);
 
+        // Closed stays closed for the requester, as both panels tell them. Answering used to reopen it,
+        // which let a requester undo any desk closure (spam, duplicate) and wiped the close reason and
+        // note that the review of a low rating reads. Only the desk reopens a closed ticket; a resolved
+        // one still reopens on the requester's answer - that is what Resolved waits for.
+        if (supportTicket.Status == SupportTicketStatus.Closed)
+            throw new FasApiErrorException("The ticket is closed", 409);
+
         var wasFinished = IsFinished(supportTicket);
         var message = _supportTicketWriter.AppendMessage(supportTicket, new SupportTicketMessageCommand
         {
@@ -262,7 +269,10 @@ public class SupportTicketService : ISupportTicketService
         var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketCloseIm.SupportTicketGuid);
         var currentUser = _aspCurrentUserService.GetCurrentUser();
 
-        if (!Enum.IsDefined(supportTicketCloseIm.CloseReason))
+        // ClosedByRequester belongs to the requester's own closure. The statistics leave it out of the
+        // desk figures, so a desk closure recorded under it would vanish from the closing agent's numbers.
+        if (!Enum.IsDefined(supportTicketCloseIm.CloseReason) ||
+            supportTicketCloseIm.CloseReason == SupportTicketCloseReason.ClosedByRequester)
             throw new FasApiErrorException("Invalid close reason", 400);
 
         if (supportTicket.Status == SupportTicketStatus.Closed)
@@ -308,20 +318,20 @@ public class SupportTicketService : ISupportTicketService
 
     public SupportTicketVm Reopen(SupportTicketReopenIm supportTicketReopenIm)
     {
+        // Desk only, like the rest of the desk closure endpoint. A requester whose ticket was closed
+        // raises a new one; letting them reopen would undo spam and duplicate closures.
+        _supportTicketDeskAccess.CheckDeskAccess();
         var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketReopenIm.SupportTicketGuid);
         var currentUser = _aspCurrentUserService.GetCurrentUser();
-        var isDeskUser = _supportTicketDeskAccess.IsDeskUser();
-
-        if (currentUser == null || (!isDeskUser && supportTicket.RequesterGuid != currentUser.Guid))
-            throw new FasApiErrorException("This ticket belongs to somebody else", 403);
 
         if (!IsFinished(supportTicket))
             throw new FasApiErrorException("Only a closed ticket can be reopened", 400);
 
+        var previousStatus = supportTicket.Status;
         var now = DateTime.UtcNow;
         _supportTicketWoRepo.UpdateData(x => x.Guid == supportTicket.Guid, x =>
         {
-            x.Status = isDeskUser ? SupportTicketStatus.Open : SupportTicketStatus.WaitingForAgent;
+            x.Status = SupportTicketStatus.Open;
             x.ClosedUtc = null;
             x.ResolvedUtc = null;
             x.CloseReason = null;
@@ -336,19 +346,17 @@ public class SupportTicketService : ISupportTicketService
             _supportTicketWriter.AppendMessage(_supportTicketWriter.GetOrThrow(supportTicket.Guid),
                 new SupportTicketMessageCommand
                 {
-                    Direction = isDeskUser
-                        ? SupportTicketMessageDirection.InternalNote
-                        : SupportTicketMessageDirection.Inbound,
-                    AuthorGuid = currentUser.Guid,
-                    AuthorName = currentUser.DisplayName,
-                    AuthorEmail = currentUser.Email,
+                    Direction = SupportTicketMessageDirection.InternalNote,
+                    AuthorGuid = currentUser?.Guid,
+                    AuthorName = currentUser?.DisplayName,
+                    AuthorEmail = currentUser?.Email,
                     Body = supportTicketReopenIm.Message
                 });
         }
 
         _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Reopened,
-            SupportTicketStatus.Closed.ToString(), null, currentUser.Guid, currentUser.DisplayName);
-        return _supportTicketViewMapper.ToDetails(_supportTicketWriter.GetOrThrow(supportTicket.Guid), isDeskUser);
+            previousStatus.ToString(), null, currentUser?.Guid, currentUser?.DisplayName);
+        return _supportTicketViewMapper.ToDetails(_supportTicketWriter.GetOrThrow(supportTicket.Guid), true);
     }
 
     private static bool IsFinished(SupportTicket supportTicket) =>

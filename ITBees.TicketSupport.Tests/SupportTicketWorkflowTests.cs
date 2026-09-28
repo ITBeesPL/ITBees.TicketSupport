@@ -135,29 +135,94 @@ public class SupportTicketWorkflowTests
     }
 
     [Test]
-    public void DeskReplyCloseAndRequesterReplyPreserveThreadAndClearClosureMetadata()
+    public void DeskReplyAndCloseAreRecordedOnceAndTheRequesterCannotAnswerAClosedTicket()
     {
         var ticket = Create();
         _desk.Setup(x => x.IsDeskUser()).Returns(true);
         var reply = _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdziliśmy bramę" });
         Assert.That(reply.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
         Assert.That(reply.FirstResponseUtc, Is.Not.Null);
-        var closed = _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, CloseNote = "Naprawiono", AskForRating = false });
+        var closed = _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.Spam, CloseNote = "Naprawiono", AskForRating = false });
         Assert.That(closed.Status, Is.EqualTo(SupportTicketStatus.Closed));
         _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
         Assert.That(_events.Rows.Count(x => x.EventType == SupportTicketEventTypes.Closed), Is.EqualTo(1));
+
         _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        var refused = Assert.Throws<FasApiErrorException>(() => _service.ReplyAsRequester(
+            new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" }));
+        var row = _tickets.Rows.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(409));
+            Assert.That(row.Status, Is.EqualTo(SupportTicketStatus.Closed));
+            Assert.That(row.CloseReason, Is.EqualTo(SupportTicketCloseReason.Spam));
+            Assert.That(row.CloseNote, Is.EqualTo("Naprawiono"));
+            Assert.That(row.ClosedByGuid, Is.EqualTo(_requester.Guid));
+            Assert.That(row.ReopenCount, Is.Zero);
+            Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+            Assert.That(_events.Rows.Any(x => x.EventType == SupportTicketEventTypes.Reopened), Is.False);
+        });
+    }
+
+    [Test]
+    public void RequesterAnswerReopensAResolvedTicket()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdziliśmy bramę" });
+        _service.ChangeStatus(new SupportTicketStatusUm { SupportTicketGuid = ticket.Guid, Status = SupportTicketStatus.Resolved });
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+
         var reopened = _service.ReplyAsRequester(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" });
         Assert.Multiple(() =>
         {
             Assert.That(reopened.Status, Is.EqualTo(SupportTicketStatus.WaitingForAgent));
             Assert.That(reopened.ReopenCount, Is.EqualTo(1));
-            Assert.That(reopened.ClosedUtc, Is.Null);
-            Assert.That(reopened.ClosedByGuid, Is.Null);
-            Assert.That(reopened.CloseNote, Is.Null);
+            Assert.That(reopened.ResolvedUtc, Is.Null);
             Assert.That(reopened.Messages, Has.Count.EqualTo(3));
-            Assert.That(reopened.Events.Select(x => x.EventType), Does.Contain(SupportTicketEventTypes.Closed).And.Contain(SupportTicketEventTypes.Reopened));
+            Assert.That(reopened.Events.Select(x => x.EventType), Does.Contain(SupportTicketEventTypes.Reopened));
         });
+    }
+
+    [Test]
+    public void OnlyTheDeskReopensAClosedTicket()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.Duplicate, CloseNote = "Zob. #100000", AskForRating = false });
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+
+        // The requester raised it, but the reopen endpoint belongs to the desk.
+        Assert.Throws<FasApiErrorException>(() => _service.Reopen(new SupportTicketReopenIm
+            { SupportTicketGuid = ticket.Guid, Message = "To nie duplikat" }));
+        Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.Closed));
+        Assert.That(_tickets.Rows.Single().CloseNote, Is.EqualTo("Zob. #100000"));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(1));
+
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var reopened = _service.Reopen(new SupportTicketReopenIm { SupportTicketGuid = ticket.Guid, Message = "Jednak nie duplikat" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(reopened.Status, Is.EqualTo(SupportTicketStatus.Open));
+            Assert.That(reopened.ReopenCount, Is.EqualTo(1));
+            Assert.That(reopened.CloseReason, Is.Null);
+            Assert.That(_messages.Rows.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.InternalNote));
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.Reopened));
+            Assert.That(_events.Rows.Last().FromValue, Is.EqualTo(nameof(SupportTicketStatus.Closed)));
+        });
+    }
+
+    [Test]
+    public void DeskCannotRecordItsClosureAsTheRequesters()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.Throws<FasApiErrorException>(() => _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.ClosedByRequester }));
+        Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.New));
+        Assert.That(_events.Rows.Any(x => x.EventType == SupportTicketEventTypes.Closed), Is.False);
     }
 
     private SupportTicketVm Create() => _service.Create(new SupportTicketIm { Subject = "Awaria", Message = "Brama nie działa" });

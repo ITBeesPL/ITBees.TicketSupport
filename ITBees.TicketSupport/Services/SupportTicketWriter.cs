@@ -102,7 +102,9 @@ public class SupportTicketWriter
                 case SupportTicketMessageDirection.Inbound:
                     if (x.Status is SupportTicketStatus.Resolved or SupportTicketStatus.Closed)
                     {
-                        // A requester answering a finished thread reopens it rather than starting a new one.
+                        // A requester answering a resolved thread reopens it rather than starting a new
+                        // one. SupportTicketService refuses the requester's answer on a closed ticket
+                        // before it gets here; the branch stays for callers that append on their own.
                         x.Status = SupportTicketStatus.WaitingForAgent;
                         x.ReopenCount++;
                         x.ClosedUtc = null;
