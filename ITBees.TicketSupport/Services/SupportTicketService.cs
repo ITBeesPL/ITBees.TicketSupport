@@ -193,34 +193,84 @@ public class SupportTicketService : ISupportTicketService
 
     public SupportTicketVm ReplyAsTrustedCaller(SupportTicketTrustedReplyCommand command)
     {
+        if (!Enum.IsDefined(command.Kind))
+            throw new FasApiErrorException("Invalid message kind", 400);
+
         var supportTicket = _supportTicketWriter.GetOrThrow(command.SupportTicketGuid);
-        if (!command.InternalNote && IsFinished(supportTicket))
+        // A note may still go on a finished ticket - the analysis belongs on record. An answer, drafted
+        // or not, needs the ticket reopened first.
+        if (command.Kind != SupportTicketTrustedMessageKind.InternalNote && IsFinished(supportTicket))
             throw new FasApiErrorException("Reopen the ticket before replying", 409);
 
         var authorName = SupportTicketInputValidation.RequireText(command.AuthorName,
             SupportTicketContentLimits.PersonName, "Author name");
         var message = _supportTicketWriter.AppendMessage(supportTicket, new SupportTicketMessageCommand
         {
-            Direction = command.InternalNote
-                ? SupportTicketMessageDirection.InternalNote
-                : SupportTicketMessageDirection.Outbound,
+            Direction = command.Kind switch
+            {
+                SupportTicketTrustedMessageKind.InternalNote => SupportTicketMessageDirection.InternalNote,
+                SupportTicketTrustedMessageKind.Reply => SupportTicketMessageDirection.Outbound,
+                _ => SupportTicketMessageDirection.DraftReply
+            },
             AuthorName = authorName,
             Body = command.Message
         });
 
-        if (command.InternalNote)
+        switch (command.Kind)
         {
-            _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.NoteAdded, null, null, null,
-                authorName);
-        }
-        else
-        {
-            _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
-            _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Replied, null, null, null,
-                authorName);
+            case SupportTicketTrustedMessageKind.InternalNote:
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.NoteAdded, null, null, null,
+                    authorName);
+                break;
+            case SupportTicketTrustedMessageKind.Reply:
+                _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Replied, null, null, null,
+                    authorName);
+                break;
+            default:
+                // Nothing moves until support publishes it: no status change, no first-response time.
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftProposed, null, null,
+                    null, authorName);
+                break;
         }
 
         // ApplyMessageToTicket keeps the loaded row in step; re-reading it could return a stale tracked copy.
+        return _supportTicketViewMapper.ToDetails(supportTicket, true);
+    }
+
+    public SupportTicketVm PublishDraft(SupportTicketDraftIm supportTicketDraftIm)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketDraftIm.SupportTicketGuid);
+        var draft = _supportTicketWriter.GetDraftOrThrow(supportTicket.Guid,
+            supportTicketDraftIm.SupportTicketMessageGuid);
+        if (IsFinished(supportTicket))
+            throw new FasApiErrorException("Reopen the ticket before replying", 409);
+
+        var currentUser = _aspCurrentUserService.GetCurrentUser();
+        var message = _supportTicketWriter.PublishDraft(draft)
+                      ?? throw new FasApiErrorException("The draft was already published or discarded", 409);
+
+        // The answer keeps its author - the assistant wrote it; the event records who let it out.
+        _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
+        _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftPublished, null, null,
+            currentUser?.Guid, currentUser?.DisplayName);
+        return _supportTicketViewMapper.ToDetails(supportTicket, true);
+    }
+
+    public SupportTicketVm DiscardDraft(SupportTicketDraftIm supportTicketDraftIm)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketDraftIm.SupportTicketGuid);
+        var draft = _supportTicketWriter.GetDraftOrThrow(supportTicket.Guid,
+            supportTicketDraftIm.SupportTicketMessageGuid);
+        var currentUser = _aspCurrentUserService.GetCurrentUser();
+
+        if (!_supportTicketWriter.DeleteDraft(draft))
+            throw new FasApiErrorException("The draft was already published or discarded", 409);
+
+        _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftDiscarded, null, null,
+            currentUser?.Guid, currentUser?.DisplayName);
         return _supportTicketViewMapper.ToDetails(supportTicket, true);
     }
 

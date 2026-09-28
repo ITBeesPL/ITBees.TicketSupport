@@ -25,11 +25,17 @@ public interface ISupportTicketService
     SupportTicketVm AddInternalNote(SupportTicketNoteIm supportTicketNoteIm);
 
     /// <summary>
-    /// A desk answer or internal note written by a caller that is not a signed-in person - an
-    /// assistant working through the host's MCP tools. No controller reaches this; the host decides
-    /// who may call it.
+    /// A draft answer, an internal note or an answer written by a caller that is not a signed-in
+    /// person - an assistant working through the host's MCP tools. No controller reaches this; the
+    /// host decides who may call it. The default kind is a draft that support has to publish.
     /// </summary>
     SupportTicketVm ReplyAsTrustedCaller(SupportTicketTrustedReplyCommand command);
+
+    /// <summary>Publishes a drafted answer to the requester, as it is. Requires desk access.</summary>
+    SupportTicketVm PublishDraft(SupportTicketDraftIm supportTicketDraftIm);
+
+    /// <summary>Throws a drafted answer away. Requires desk access.</summary>
+    SupportTicketVm DiscardDraft(SupportTicketDraftIm supportTicketDraftIm);
 
     SupportTicketVm Assign(SupportTicketAssignUm supportTicketAssignUm);
 

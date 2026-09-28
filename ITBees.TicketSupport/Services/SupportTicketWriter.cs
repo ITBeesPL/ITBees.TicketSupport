@@ -18,6 +18,7 @@ public class SupportTicketWriter
     private readonly IWriteOnlyRepository<SupportTicket> _supportTicketWoRepo;
     private readonly IReadOnlyRepository<SupportTicket> _supportTicketRoRepo;
     private readonly IWriteOnlyRepository<SupportTicketMessage> _supportTicketMessageWoRepo;
+    private readonly IReadOnlyRepository<SupportTicketMessage> _supportTicketMessageRoRepo;
     private readonly IWriteOnlyRepository<SupportTicketEvent> _supportTicketEventWoRepo;
     private readonly ISupportTicketNumberGenerator _supportTicketNumberGenerator;
     private readonly ILogger<SupportTicketWriter> _logger;
@@ -25,12 +26,14 @@ public class SupportTicketWriter
     public SupportTicketWriter(IWriteOnlyRepository<SupportTicket> supportTicketWoRepo,
         IReadOnlyRepository<SupportTicket> supportTicketRoRepo,
         IWriteOnlyRepository<SupportTicketMessage> supportTicketMessageWoRepo,
+        IReadOnlyRepository<SupportTicketMessage> supportTicketMessageRoRepo,
         IWriteOnlyRepository<SupportTicketEvent> supportTicketEventWoRepo,
         ISupportTicketNumberGenerator supportTicketNumberGenerator, ILogger<SupportTicketWriter> logger)
     {
         _supportTicketWoRepo = supportTicketWoRepo;
         _supportTicketRoRepo = supportTicketRoRepo;
         _supportTicketMessageWoRepo = supportTicketMessageWoRepo;
+        _supportTicketMessageRoRepo = supportTicketMessageRoRepo;
         _supportTicketEventWoRepo = supportTicketEventWoRepo;
         _supportTicketNumberGenerator = supportTicketNumberGenerator;
         _logger = logger;
@@ -76,13 +79,45 @@ public class SupportTicketWriter
             AuthorEmail = SupportTicketInputValidation.Trim(command.AuthorEmail, SupportTicketContentLimits.Email),
             Body = body,
             BodyHtml = bodyHtml,
-            IsPublic = command.Direction != SupportTicketMessageDirection.InternalNote,
+            // Only the two sides of the conversation are public; notes and drafts stay on the desk.
+            IsPublic = command.Direction is SupportTicketMessageDirection.Inbound
+                or SupportTicketMessageDirection.Outbound,
             CreatedUtc = DateTime.UtcNow
         };
 
         _supportTicketMessageWoRepo.InsertData(message);
         return message;
     }
+
+    public SupportTicketMessage GetDraftOrThrow(Guid supportTicketGuid, Guid supportTicketMessageGuid)
+    {
+        return _supportTicketMessageRoRepo.GetFirst(x => x.Guid == supportTicketMessageGuid &&
+                                                         x.SupportTicketGuid == supportTicketGuid &&
+                                                         x.Direction == SupportTicketMessageDirection.DraftReply)
+               ?? throw new ResultNotFoundException("Draft was not found");
+    }
+
+    /// <summary>
+    /// Turns the draft into the desk's answer in place, dated now: the requester sees it from this
+    /// moment, and the draft is gone from the desk view. Null when somebody else got there first.
+    /// </summary>
+    public SupportTicketMessage PublishDraft(SupportTicketMessage draft)
+    {
+        var now = DateTime.UtcNow;
+        return _supportTicketMessageWoRepo.UpdateData(
+                x => x.Guid == draft.Guid && x.Direction == SupportTicketMessageDirection.DraftReply, x =>
+                {
+                    x.Direction = SupportTicketMessageDirection.Outbound;
+                    x.IsPublic = true;
+                    x.CreatedUtc = now;
+                })
+            .FirstOrDefault();
+    }
+
+    /// <summary>False when the draft was already published or discarded.</summary>
+    public bool DeleteDraft(SupportTicketMessage draft) =>
+        _supportTicketMessageWoRepo.DeleteData(x =>
+            x.Guid == draft.Guid && x.Direction == SupportTicketMessageDirection.DraftReply) > 0;
 
     /// <summary>Moves the ticket through its life cycle after a public message was added.</summary>
     public void ApplyMessageToTicket(SupportTicket supportTicket, SupportTicketMessage message)

@@ -78,7 +78,7 @@ public class SupportTicketWorkflowTests
         var resolver = _resolver = new Mock<ISupportTicketRequesterResolver>();
         resolver.Setup(x => x.ResolveNames(It.IsAny<IReadOnlyCollection<Guid>>())).Returns(new Dictionary<Guid, string>());
         var writer = _writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
-            _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
+            _messages.Read.Object, _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
         var mapper = _mapper = new SupportTicketViewMapper(_messages.Read.Object, _attachments.Read.Object, _ratings.Read.Object,
             _events.Read.Object, resolver.Object);
         _ratingService = new SupportTicketRatingService(_ratings.Read.Object, _ratings.Write.Object,
@@ -684,13 +684,19 @@ public class SupportTicketWorkflowTests
     {
         var ticket = Create();
         _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Root cause: loop 2 stuck", InternalNote = true });
+        {
+            SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Root cause: loop 2 stuck",
+            Kind = SupportTicketTrustedMessageKind.InternalNote
+        });
         var afterNote = _tickets.Rows.Single();
         Assert.That(afterNote.Status, Is.EqualTo(SupportTicketStatus.New));
         Assert.That(afterNote.FirstResponseUtc, Is.Null);
 
         var answered = _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Szlaban otworzył się po 3 s." });
+        {
+            SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Szlaban otworzył się po 3 s.",
+            Kind = SupportTicketTrustedMessageKind.Reply
+        });
         Assert.Multiple(() =>
         {
             Assert.That(answered.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
@@ -717,15 +723,125 @@ public class SupportTicketWorkflowTests
         _desk.Setup(x => x.IsDeskUser()).Returns(true);
         _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
         Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late" }));
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late", Kind = SupportTicketTrustedMessageKind.Reply }));
         Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, Message = "Nameless", InternalNote = true }));
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late for a draft too" }));
+        Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
+            { SupportTicketGuid = ticket.Guid, Message = "Nameless", Kind = SupportTicketTrustedMessageKind.InternalNote }));
         Assert.That(_messages.Rows, Has.Count.EqualTo(1));
 
         // A note on a finished ticket is still allowed - the desk may want the analysis on record.
         _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Post-mortem", InternalNote = true });
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Post-mortem", Kind = SupportTicketTrustedMessageKind.InternalNote });
         Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.Closed));
+    }
+
+    private SupportTicketMessage Draft(SupportTicketVm ticket, string message = "Szlaban otworzył się po 3 s.")
+    {
+        // No Kind: the default has to be the draft.
+        _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = message });
+        return _messages.Rows.Last();
+    }
+
+    [Test]
+    public void TrustedCallerDraftsByDefaultAndTheRequesterSeesNothingUntilSupportPublishes()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        var row = _tickets.Rows.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+            Assert.That(draft.IsPublic, Is.False);
+            Assert.That(row.Status, Is.EqualTo(SupportTicketStatus.New));
+            Assert.That(row.FirstResponseUtc, Is.Null);
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftProposed));
+        });
+
+        var requesterView = _query.GetDetails(ticket.Guid, true);
+        Assert.That(requesterView.Messages, Has.Count.EqualTo(1));
+        Assert.That(requesterView.Events.Select(x => x.EventType), Does.Not.Contain(SupportTicketEventTypes.DraftProposed));
+        Assert.That(_query.GetMine(new SupportTicketListFilter()).Data.Single().MessageCount, Is.EqualTo(1));
+
+        var approver = new CurrentUser { Guid = Guid.NewGuid(), Email = "agent@example.test", DisplayName = "Agent" };
+        var requester = _requester;
+        _requester = approver;
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.That(_query.GetDetails(ticket.Guid).Messages.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+        var published = _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid });
+        Assert.Multiple(() =>
+        {
+            Assert.That(published.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
+            Assert.That(published.FirstResponseUtc, Is.Not.Null);
+            Assert.That(published.Messages.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.Outbound));
+            Assert.That(published.Messages.Last().AuthorName, Is.EqualTo("Octopark AI"));
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftPublished));
+            Assert.That(_events.Rows.Last().ActorGuid, Is.EqualTo(approver.Guid));
+        });
+
+        _requester = requester;
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        Assert.That(_query.GetDetails(ticket.Guid, true).Messages.Last().Body, Is.EqualTo("Szlaban otworzył się po 3 s."));
+
+        // Published once: a second click finds no draft.
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid }));
+    }
+
+    [Test]
+    public void OnlyTheDeskPublishesOrDiscardsADraft()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        var im = new SupportTicketDraftIm { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid };
+
+        Assert.Throws<FasApiErrorException>(() => _service.PublishDraft(im));
+        Assert.Throws<FasApiErrorException>(() => _service.DiscardDraft(im));
+        Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void DiscardedDraftIsGoneAndOnlyDraftsCanBePublished()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+
+        // The requester's own message and a note are not drafts, and a draft of another ticket is not this one's.
+        var other = Create();
+        var otherDraft = Draft(other);
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = _messages.Rows.First().Guid }));
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = otherDraft.Guid }));
+
+        var discarded = _service.DiscardDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid });
+        Assert.Multiple(() =>
+        {
+            Assert.That(_messages.Rows.Any(x => x.Guid == draft.Guid), Is.False);
+            Assert.That(discarded.Messages, Has.Count.EqualTo(1));
+            Assert.That(discarded.Events.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftDiscarded));
+            Assert.That(_tickets.Rows.First(x => x.Guid == ticket.Guid).Status, Is.EqualTo(SupportTicketStatus.New));
+        });
+    }
+
+    [Test]
+    public void ADraftCannotBePublishedOnAClosedTicket()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
+
+        var refused = Assert.Throws<FasApiErrorException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid }));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(409));
+        Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
     }
 
     private static SupportTicketIm NewTicketIm(string message = "Brama nie działa") =>
@@ -839,6 +955,8 @@ public class SupportTicketWorkflowTests
             Read.Setup(x => x.GetDataQueryable(It.IsAny<Expression<Func<T, bool>>>()))
                 .Returns((Expression<Func<T, bool>> predicate) => Rows.AsQueryable().Where(predicate));
             Write.Setup(x => x.InsertData(It.IsAny<T>())).Returns((T value) => { Rows.Add(value); return value; });
+            Write.Setup(x => x.DeleteData(It.IsAny<Expression<Func<T, bool>>>()))
+                .Returns((Expression<Func<T, bool>> predicate) => Rows.RemoveAll(new Predicate<T>(predicate.Compile())));
             Write.Setup(x => x.UpdateData(It.IsAny<Expression<Func<T, bool>>>(), It.IsAny<Action<T>>(), It.IsAny<Expression<Func<T, object>>[]>()))
                 .Returns((Expression<Func<T, bool>> predicate, Action<T> change, Expression<Func<T, object>>[] _) =>
                 {

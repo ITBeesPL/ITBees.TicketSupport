@@ -147,6 +147,40 @@ public class SupportTicketDeskMessageController : RestfulControllerBase<SupportT
     }
 }
 
+/// <summary>
+/// Answers an assistant drafted: support publishes them to the requester as they are, or discards
+/// them. Nothing an assistant writes reaches the requester any other way.
+/// </summary>
+[Authorize]
+public class SupportTicketDeskDraftController : RestfulControllerBase<SupportTicketDeskDraftController>
+{
+    private readonly ISupportTicketService _supportTicketService;
+
+    public SupportTicketDeskDraftController(ILogger<SupportTicketDeskDraftController> logger,
+        ISupportTicketService supportTicketService) : base(logger)
+    {
+        _supportTicketService = supportTicketService;
+    }
+
+    [HttpPost]
+    [Produces<SupportTicketVm>]
+    public IActionResult Post(SupportTicketDraftIm supportTicketDraftIm)
+    {
+        return ReturnOkResult(() => _supportTicketService.PublishDraft(supportTicketDraftIm), supportTicketDraftIm);
+    }
+
+    [HttpDelete]
+    [Produces<SupportTicketVm>]
+    public IActionResult Delete([FromQuery] Guid supportTicketGuid, [FromQuery] Guid supportTicketMessageGuid)
+    {
+        return ReturnOkResult(() => _supportTicketService.DiscardDraft(new SupportTicketDraftIm
+        {
+            SupportTicketGuid = supportTicketGuid,
+            SupportTicketMessageGuid = supportTicketMessageGuid
+        }));
+    }
+}
+
 [Authorize]
 public class SupportTicketDeskClosureController : RestfulControllerBase<SupportTicketDeskClosureController>
 {

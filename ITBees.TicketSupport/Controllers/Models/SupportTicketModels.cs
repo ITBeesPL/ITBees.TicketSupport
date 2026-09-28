@@ -137,6 +137,15 @@ public class SupportTicketNoteIm : RestIm
     public string Message { get; set; }
 }
 
+/// <summary>A drafted answer the desk publishes or discards.</summary>
+public class SupportTicketDraftIm : RestIm
+{
+    public Guid SupportTicketGuid { get; set; }
+
+    /// <summary>The draft message, as the desk view of the ticket lists it.</summary>
+    public Guid SupportTicketMessageGuid { get; set; }
+}
+
 public class SupportTicketAssignUm : RestUm
 {
     public Guid SupportTicketGuid { get; set; }
