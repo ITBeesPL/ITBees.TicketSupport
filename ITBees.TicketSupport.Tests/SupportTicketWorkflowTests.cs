@@ -27,6 +27,7 @@ public class SupportTicketWorkflowTests
     private List<SupportTicketContextVm> _contexts = null!;
     private Mock<IAspCurrentUserService> _currentUser = null!;
     private Mock<ISupportTicketDeskAccess> _desk = null!;
+    private Mock<ISupportTicketRequesterResolver> _resolver = null!;
     private SupportTicketService _service = null!;
     private SupportTicketQueryService _query = null!;
     private SupportTicketRequesterClosureService _closureService = null!;
@@ -52,7 +53,7 @@ public class SupportTicketWorkflowTests
         {
             if (!_desk.Object.IsDeskUser()) throw new FasApiErrorException("Forbidden", 403);
         });
-        var resolver = new Mock<ISupportTicketRequesterResolver>();
+        var resolver = _resolver = new Mock<ISupportTicketRequesterResolver>();
         resolver.Setup(x => x.ResolveNames(It.IsAny<IReadOnlyCollection<Guid>>())).Returns(new Dictionary<Guid, string>());
         var writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
             _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
@@ -86,6 +87,46 @@ public class SupportTicketWorkflowTests
             Assert.That(result.Messages.Single().BodyHtml, Does.Contain("<table>").And.Contain("data:image/png"));
             Assert.That(result.Events.Single().EventType, Is.EqualTo(SupportTicketEventTypes.Created));
         });
+    }
+
+    [Test]
+    public void DeskUserOnTheRequesterEndpointFilesUnderOwnIdentity()
+    {
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var result = _service.Create(new SupportTicketIm
+            { Subject = "Awaria", Message = "Brama", RequesterEmail = "somebody@example.test", RequesterName = "Somebody" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.RequesterGuid, Is.EqualTo(_requester.Guid));
+            Assert.That(result.RequesterEmail, Is.EqualTo(_requester.Email));
+            Assert.That(result.Channel, Is.EqualTo(SupportTicketChannel.Panel));
+        });
+        _resolver.Verify(x => x.ResolveByEmail(It.IsAny<string>()), Times.Never);
+    }
+
+    [Test]
+    public void DeskEntersATicketForSomebodyElse()
+    {
+        var caller = new SupportTicketPerson { Guid = Guid.NewGuid(), Email = "caller@example.test", DisplayName = "Caller" };
+        _resolver.Setup(x => x.ResolveByEmail("caller@example.test")).Returns(caller);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var result = _service.CreateFromDesk(new SupportTicketIm
+            { Subject = "Telefon", Message = "Nie działa brama", RequesterEmail = " caller@example.test " });
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.RequesterGuid, Is.EqualTo(caller.Guid));
+            Assert.That(result.RequesterEmail, Is.EqualTo(caller.Email));
+            Assert.That(result.Channel, Is.EqualTo(SupportTicketChannel.Phone));
+        });
+    }
+
+    [Test]
+    public void OnlyTheDeskEntersTicketsForSomebodyElse()
+    {
+        Assert.Throws<FasApiErrorException>(() => _service.CreateFromDesk(new SupportTicketIm
+            { Subject = "Telefon", Message = "Brama", RequesterEmail = "victim@example.test" }));
+        Assert.That(_tickets.Rows, Is.Empty);
+        _resolver.Verify(x => x.ResolveByEmail(It.IsAny<string>()), Times.Never);
     }
 
     [Test]

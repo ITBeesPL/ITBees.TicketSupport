@@ -38,11 +38,20 @@ public class SupportTicketService : ISupportTicketService
         _supportTicketRequesterAccess = supportTicketRequesterAccess;
     }
 
-    public SupportTicketVm Create(SupportTicketIm supportTicketIm, SupportTicketReference reference = null)
+    public SupportTicketVm Create(SupportTicketIm supportTicketIm, SupportTicketReference reference = null) =>
+        CreateTicket(supportTicketIm, reference, false);
+
+    public SupportTicketVm CreateFromDesk(SupportTicketIm supportTicketIm, SupportTicketReference reference = null)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        return CreateTicket(supportTicketIm, reference, true);
+    }
+
+    private SupportTicketVm CreateTicket(SupportTicketIm supportTicketIm, SupportTicketReference reference,
+        bool fromDesk)
     {
         var currentUser = _aspCurrentUserService.GetCurrentUser();
-        var isDeskUser = _supportTicketDeskAccess.IsDeskUser();
-        var requester = ResolveRequester(supportTicketIm, currentUser, isDeskUser);
+        var requester = ResolveRequester(supportTicketIm, currentUser, fromDesk);
         var context = _supportTicketRequesterAccess.CheckContext(supportTicketIm.ContextType,
             supportTicketIm.ContextGuid, true);
 
@@ -56,7 +65,7 @@ public class SupportTicketService : ISupportTicketService
             throw new FasApiErrorException("Reference type and identifier must be provided together", 400);
 
         // Support entering a ticket on somebody else's behalf means it came in by phone.
-        var channel = isDeskUser && requester.Guid != currentUser?.Guid
+        var channel = fromDesk && requester.Guid != currentUser?.Guid
             ? SupportTicketChannel.Phone
             : SupportTicketChannel.Panel;
 
@@ -88,7 +97,7 @@ public class SupportTicketService : ISupportTicketService
         });
 
         _supportTicketNotifier.TicketCreated(supportTicket);
-        return _supportTicketViewMapper.ToDetails(supportTicket, false);
+        return _supportTicketViewMapper.ToDetails(supportTicket, fromDesk);
     }
 
     public SupportTicketVm ReplyAsRequester(SupportTicketReplyIm supportTicketReplyIm)
@@ -363,9 +372,11 @@ public class SupportTicketService : ISupportTicketService
         supportTicket.Status is SupportTicketStatus.Resolved or SupportTicketStatus.Closed;
 
     private SupportTicketPerson ResolveRequester(SupportTicketIm supportTicketIm, CurrentUser currentUser,
-        bool isDeskUser)
+        bool fromDesk)
     {
-        if (isDeskUser && !string.IsNullOrWhiteSpace(supportTicketIm.RequesterEmail))
+        // Only the desk path (desk access already checked) files a ticket for somebody else; the
+        // requester path identifies the requester from the session, whoever is signed in.
+        if (fromDesk && !string.IsNullOrWhiteSpace(supportTicketIm.RequesterEmail))
         {
             var email = SupportTicketInputValidation.Trim(supportTicketIm.RequesterEmail, SupportTicketContentLimits.Email);
             if (!SupportTicketInputValidation.IsEmailAddress(email))

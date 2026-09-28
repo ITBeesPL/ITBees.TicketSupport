@@ -6,10 +6,17 @@ namespace ITBees.TicketSupport.Interfaces;
 public interface ISupportTicketService
 {
     /// <summary>
-    /// A new ticket from a panel. <paramref name="reference"/> is for host code only: it links the
+    /// A new ticket from a panel, raised by the signed-in user for themselves - the requester fields
+    /// of the payload are ignored. <paramref name="reference"/> is for host code only: it links the
     /// ticket to the host object it was raised about, after the host validated that object.
     /// </summary>
     SupportTicketVm Create(SupportTicketIm supportTicketIm, SupportTicketReference reference = null);
+
+    /// <summary>
+    /// A ticket entered by support, typically after a phone call, for the person named by
+    /// <see cref="SupportTicketIm.RequesterEmail"/>. Requires desk access.
+    /// </summary>
+    SupportTicketVm CreateFromDesk(SupportTicketIm supportTicketIm, SupportTicketReference reference = null);
 
     SupportTicketVm ReplyAsRequester(SupportTicketReplyIm supportTicketReplyIm);
 

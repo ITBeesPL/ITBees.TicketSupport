@@ -83,7 +83,7 @@ public class SupportTicketDeskController : RestfulControllerBase<SupportTicketDe
     [Produces<SupportTicketVm>]
     public IActionResult Post(SupportTicketIm supportTicketIm)
     {
-        return ReturnOkResult(() => _supportTicketService.Create(supportTicketIm), supportTicketIm);
+        return ReturnOkResult(() => _supportTicketService.CreateFromDesk(supportTicketIm), supportTicketIm);
     }
 
     [HttpPut]
