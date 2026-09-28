@@ -40,6 +40,35 @@ public class SupportTicketRichTextTests
     public void RejectsOversizedHtmlInsteadOfTruncatingAnImage() =>
         Assert.Throws<FasApiErrorException>(() => SupportTicketRichText.Normalize("test", new string('x', SupportTicketContentLimits.BodyHtml + 1)));
 
+    [TestCase("https://tracker.example.test/pixel.png")]
+    [TestCase("http://192.168.1.1/cgi-bin/reboot")]
+    [TestCase("//tracker.example.test/pixel.png")]
+    public void DropsImagesFetchedFromElsewhere(string src)
+    {
+        var value = SupportTicketRichText.Normalize(null, $"<p>Brama <img src='{src}'></p>");
+        Assert.Multiple(() =>
+        {
+            Assert.That(value.Html, Does.Not.Contain("<img"));
+            Assert.That(value.Html, Does.Not.Contain(src));
+            Assert.That(value.Body, Is.EqualTo("Brama"));
+        });
+    }
+
+    [Test]
+    public void RejectsAMessageMadeOnlyOfARemoteImage() =>
+        Assert.Throws<FasApiErrorException>(() =>
+            SupportTicketRichText.Normalize(null, "<p><img src='https://tracker.example.test/pixel.png'></p>"));
+
+    [Test]
+    public void RejectsMarkupThatGrowsPastTheLimitWhenSerialized()
+    {
+        // 2 M characters in, "&" -> "&amp;" makes it 10 M out - over the 8 MB the column and the panels expect.
+        var html = "<p title=\"" + new string('&', 2_000_000) + "\">x</p>";
+        Assert.That(html.Length, Is.LessThan(SupportTicketContentLimits.BodyHtml));
+        var exception = Assert.Throws<FasApiErrorException>(() => SupportTicketRichText.Normalize(null, html));
+        Assert.That(exception!.Message, Is.EqualTo("Message is too large"));
+    }
+
     [Test]
     public void PreservesLegacyPlainMessages() => Assert.That(
         SupportTicketRichText.Normalize("Pierwsza linia\nDruga linia", null).Body, Is.EqualTo("Pierwsza linia\nDruga linia"));
