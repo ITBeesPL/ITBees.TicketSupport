@@ -10,6 +10,21 @@ public class SupportTicketTrustedReplyCommand
 
     public string Message { get; set; }
 
-    /// <summary>True keeps the message on the desk side; false answers the requester.</summary>
-    public bool InternalNote { get; set; }
+    /// <summary>
+    /// What the message becomes. The default is a draft, so a caller that forgets to choose never
+    /// reaches the requester without support reading it first.
+    /// </summary>
+    public SupportTicketTrustedMessageKind Kind { get; set; } = SupportTicketTrustedMessageKind.DraftReply;
+}
+
+public enum SupportTicketTrustedMessageKind
+{
+    /// <summary>An answer support reads and then publishes or discards. The requester sees nothing yet.</summary>
+    DraftReply = 0,
+
+    /// <summary>A note for the desk only.</summary>
+    InternalNote = 1,
+
+    /// <summary>An answer published to the requester straight away.</summary>
+    Reply = 2
 }

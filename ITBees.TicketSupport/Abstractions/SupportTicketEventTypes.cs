@@ -23,4 +23,13 @@ public static class SupportTicketEventTypes
     public const string RatingRequested = "rating_requested";
 
     public const string Rated = "rated";
+
+    /// <summary>A trusted caller proposed an answer; the actor name is the caller's.</summary>
+    public const string DraftProposed = "draft_proposed";
+
+    /// <summary>Support published a proposed answer to the requester; the actor is who published it.</summary>
+    public const string DraftPublished = "draft_published";
+
+    /// <summary>Support threw a proposed answer away.</summary>
+    public const string DraftDiscarded = "draft_discarded";
 }

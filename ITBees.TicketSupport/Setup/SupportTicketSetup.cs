@@ -29,6 +29,8 @@ public class SupportTicketSetup
         services.TryAddScoped<ISupportTicketLinkBuilder, ConfiguredSupportTicketLinkBuilder>();
         services.TryAddScoped<ISupportTicketAttachmentStore, NullSupportTicketAttachmentStore>();
         services.TryAddScoped<ISupportTicketNotifier, NullSupportTicketNotifier>();
+        // One instance per process: the buckets must outlive the request that fills them.
+        services.TryAddSingleton<ISupportTicketRateLimiter, InMemorySupportTicketRateLimiter>();
     }
 
     /// <summary>Routes desk events through ITBees.Alerts instead of dropping them.</summary>

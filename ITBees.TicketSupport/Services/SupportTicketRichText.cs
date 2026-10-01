@@ -7,6 +7,15 @@ namespace ITBees.TicketSupport.Services;
 
 public static class SupportTicketRichText
 {
+    // Only pictures carried inside the message itself. A remote address would be fetched by the
+    // browser of everybody who opens the ticket - support staff included - which turns a message
+    // into a tracking pixel (IP address, time of reading) or into a GET request against whatever the
+    // reader's browser can reach. The panels' editors embed pictures as data URIs anyway.
+    private static readonly string[] InlineRasterImagePrefixes =
+    {
+        "data:image/png;base64,", "data:image/jpeg;base64,", "data:image/gif;base64,", "data:image/webp;base64,"
+    };
+
     public static (string Body, string Html) Normalize(string body, string html)
     {
         if (html?.Length > SupportTicketContentLimits.BodyHtml || body?.Length > SupportTicketContentLimits.Body)
@@ -35,14 +44,15 @@ public static class SupportTicketRichText
         foreach (var img in document.QuerySelectorAll("img"))
         {
             var src = img.GetAttribute("src") ?? "";
-            var raster = new[] { "data:image/png;base64,", "data:image/jpeg;base64,", "data:image/gif;base64,", "data:image/webp;base64," }
-                .Any(prefix => src.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-            var remote = Uri.TryCreate(src, UriKind.Absolute, out var uri) && uri.Scheme is "https" or "http";
-            if (!raster && !remote)
+            if (!InlineRasterImagePrefixes.Any(prefix => src.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
                 img.Remove();
         }
 
         var safeHtml = document.Body.InnerHtml;
+        // Serializing escapes what the parser read as text ("&" becomes "&amp;"), so the stored markup
+        // can be several times longer than the input the first check measured.
+        if (safeHtml.Length > SupportTicketContentLimits.BodyHtml)
+            throw new FasApiErrorException("Message is too large", 400);
         // Derive searchable plain text on the server; never trust a separate client preview.
         foreach (var br in document.QuerySelectorAll("br"))
             br.Replace(document.CreateTextNode("\n"));

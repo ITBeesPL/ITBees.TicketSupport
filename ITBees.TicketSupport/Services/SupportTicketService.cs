@@ -20,13 +20,16 @@ public class SupportTicketService : ISupportTicketService
     private readonly ISupportTicketNotifier _supportTicketNotifier;
     private readonly IAspCurrentUserService _aspCurrentUserService;
     private readonly SupportTicketRequesterAccess _supportTicketRequesterAccess;
+    private readonly ISupportTicketRateLimiter _supportTicketRateLimiter;
 
     public SupportTicketService(IWriteOnlyRepository<SupportTicket> supportTicketWoRepo,
         SupportTicketWriter supportTicketWriter, SupportTicketViewMapper supportTicketViewMapper,
         ISupportTicketDeskAccess supportTicketDeskAccess, ISupportTicketRequesterResolver supportTicketRequesterResolver,
         ISupportTicketRatingService supportTicketRatingService, ISupportTicketNotifier supportTicketNotifier,
-        IAspCurrentUserService aspCurrentUserService, SupportTicketRequesterAccess supportTicketRequesterAccess)
+        IAspCurrentUserService aspCurrentUserService, SupportTicketRequesterAccess supportTicketRequesterAccess,
+        ISupportTicketRateLimiter supportTicketRateLimiter)
     {
+        _supportTicketRateLimiter = supportTicketRateLimiter;
         _supportTicketWoRepo = supportTicketWoRepo;
         _supportTicketWriter = supportTicketWriter;
         _supportTicketViewMapper = supportTicketViewMapper;
@@ -38,11 +41,27 @@ public class SupportTicketService : ISupportTicketService
         _supportTicketRequesterAccess = supportTicketRequesterAccess;
     }
 
-    public SupportTicketVm Create(SupportTicketIm supportTicketIm, SupportTicketReference reference = null)
+    public SupportTicketVm Create(SupportTicketIm supportTicketIm, SupportTicketReference reference = null) =>
+        CreateTicket(supportTicketIm, reference, false);
+
+    public SupportTicketVm CreateFromDesk(SupportTicketIm supportTicketIm, SupportTicketReference reference = null)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        return CreateTicket(supportTicketIm, reference, true);
+    }
+
+    private SupportTicketVm CreateTicket(SupportTicketIm supportTicketIm, SupportTicketReference reference,
+        bool fromDesk)
     {
         var currentUser = _aspCurrentUserService.GetCurrentUser();
-        var isDeskUser = _supportTicketDeskAccess.IsDeskUser();
-        var requester = ResolveRequester(supportTicketIm, currentUser, isDeskUser);
+        var requester = ResolveRequester(supportTicketIm, currentUser, fromDesk);
+
+        // Requesters only - the requester path has a signed-in user by now. Checked before the
+        // sanitizing and the writes, so a flood costs neither.
+        if (!fromDesk)
+            _supportTicketRateLimiter.CheckNewTicket(currentUser.Guid,
+                ContentLength(supportTicketIm.Message, supportTicketIm.MessageHtml));
+
         var context = _supportTicketRequesterAccess.CheckContext(supportTicketIm.ContextType,
             supportTicketIm.ContextGuid, true);
 
@@ -56,7 +75,7 @@ public class SupportTicketService : ISupportTicketService
             throw new FasApiErrorException("Reference type and identifier must be provided together", 400);
 
         // Support entering a ticket on somebody else's behalf means it came in by phone.
-        var channel = isDeskUser && requester.Guid != currentUser?.Guid
+        var channel = fromDesk && requester.Guid != currentUser?.Guid
             ? SupportTicketChannel.Phone
             : SupportTicketChannel.Panel;
 
@@ -88,7 +107,7 @@ public class SupportTicketService : ISupportTicketService
         });
 
         _supportTicketNotifier.TicketCreated(supportTicket);
-        return _supportTicketViewMapper.ToDetails(supportTicket, false);
+        return _supportTicketViewMapper.ToDetails(supportTicket, fromDesk);
     }
 
     public SupportTicketVm ReplyAsRequester(SupportTicketReplyIm supportTicketReplyIm)
@@ -96,6 +115,17 @@ public class SupportTicketService : ISupportTicketService
         var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketReplyIm.SupportTicketGuid);
         var currentUser = _aspCurrentUserService.GetCurrentUser();
         _supportTicketRequesterAccess.Check(supportTicket, true);
+
+        // Closed stays closed for the requester, as both panels tell them. Answering used to reopen it,
+        // which let a requester undo any desk closure (spam, duplicate) and wiped the close reason and
+        // note that the review of a low rating reads. Only the desk reopens a closed ticket; a resolved
+        // one still reopens on the requester's answer - that is what Resolved waits for.
+        if (supportTicket.Status == SupportTicketStatus.Closed)
+            throw new FasApiErrorException("The ticket is closed", 409);
+
+        // Check above guarantees a signed-in user.
+        _supportTicketRateLimiter.CheckMessage(_aspCurrentUserService.GetCurrentUserGuid().Value,
+            ContentLength(supportTicketReplyIm.Message, supportTicketReplyIm.MessageHtml));
 
         var wasFinished = IsFinished(supportTicket);
         var message = _supportTicketWriter.AppendMessage(supportTicket, new SupportTicketMessageCommand
@@ -163,34 +193,84 @@ public class SupportTicketService : ISupportTicketService
 
     public SupportTicketVm ReplyAsTrustedCaller(SupportTicketTrustedReplyCommand command)
     {
+        if (!Enum.IsDefined(command.Kind))
+            throw new FasApiErrorException("Invalid message kind", 400);
+
         var supportTicket = _supportTicketWriter.GetOrThrow(command.SupportTicketGuid);
-        if (!command.InternalNote && IsFinished(supportTicket))
+        // A note may still go on a finished ticket - the analysis belongs on record. An answer, drafted
+        // or not, needs the ticket reopened first.
+        if (command.Kind != SupportTicketTrustedMessageKind.InternalNote && IsFinished(supportTicket))
             throw new FasApiErrorException("Reopen the ticket before replying", 409);
 
         var authorName = SupportTicketInputValidation.RequireText(command.AuthorName,
             SupportTicketContentLimits.PersonName, "Author name");
         var message = _supportTicketWriter.AppendMessage(supportTicket, new SupportTicketMessageCommand
         {
-            Direction = command.InternalNote
-                ? SupportTicketMessageDirection.InternalNote
-                : SupportTicketMessageDirection.Outbound,
+            Direction = command.Kind switch
+            {
+                SupportTicketTrustedMessageKind.InternalNote => SupportTicketMessageDirection.InternalNote,
+                SupportTicketTrustedMessageKind.Reply => SupportTicketMessageDirection.Outbound,
+                _ => SupportTicketMessageDirection.DraftReply
+            },
             AuthorName = authorName,
             Body = command.Message
         });
 
-        if (command.InternalNote)
+        switch (command.Kind)
         {
-            _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.NoteAdded, null, null, null,
-                authorName);
-        }
-        else
-        {
-            _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
-            _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Replied, null, null, null,
-                authorName);
+            case SupportTicketTrustedMessageKind.InternalNote:
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.NoteAdded, null, null, null,
+                    authorName);
+                break;
+            case SupportTicketTrustedMessageKind.Reply:
+                _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Replied, null, null, null,
+                    authorName);
+                break;
+            default:
+                // Nothing moves until support publishes it: no status change, no first-response time.
+                _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftProposed, null, null,
+                    null, authorName);
+                break;
         }
 
         // ApplyMessageToTicket keeps the loaded row in step; re-reading it could return a stale tracked copy.
+        return _supportTicketViewMapper.ToDetails(supportTicket, true);
+    }
+
+    public SupportTicketVm PublishDraft(SupportTicketDraftIm supportTicketDraftIm)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketDraftIm.SupportTicketGuid);
+        var draft = _supportTicketWriter.GetDraftOrThrow(supportTicket.Guid,
+            supportTicketDraftIm.SupportTicketMessageGuid);
+        if (IsFinished(supportTicket))
+            throw new FasApiErrorException("Reopen the ticket before replying", 409);
+
+        var currentUser = _aspCurrentUserService.GetCurrentUser();
+        var message = _supportTicketWriter.PublishDraft(draft)
+                      ?? throw new FasApiErrorException("The draft was already published or discarded", 409);
+
+        // The answer keeps its author - the assistant wrote it; the event records who let it out.
+        _supportTicketWriter.ApplyMessageToTicket(supportTicket, message);
+        _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftPublished, null, null,
+            currentUser?.Guid, currentUser?.DisplayName);
+        return _supportTicketViewMapper.ToDetails(supportTicket, true);
+    }
+
+    public SupportTicketVm DiscardDraft(SupportTicketDraftIm supportTicketDraftIm)
+    {
+        _supportTicketDeskAccess.CheckDeskAccess();
+        var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketDraftIm.SupportTicketGuid);
+        var draft = _supportTicketWriter.GetDraftOrThrow(supportTicket.Guid,
+            supportTicketDraftIm.SupportTicketMessageGuid);
+        var currentUser = _aspCurrentUserService.GetCurrentUser();
+
+        if (!_supportTicketWriter.DeleteDraft(draft))
+            throw new FasApiErrorException("The draft was already published or discarded", 409);
+
+        _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.DraftDiscarded, null, null,
+            currentUser?.Guid, currentUser?.DisplayName);
         return _supportTicketViewMapper.ToDetails(supportTicket, true);
     }
 
@@ -262,7 +342,10 @@ public class SupportTicketService : ISupportTicketService
         var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketCloseIm.SupportTicketGuid);
         var currentUser = _aspCurrentUserService.GetCurrentUser();
 
-        if (!Enum.IsDefined(supportTicketCloseIm.CloseReason))
+        // ClosedByRequester belongs to the requester's own closure. The statistics leave it out of the
+        // desk figures, so a desk closure recorded under it would vanish from the closing agent's numbers.
+        if (!Enum.IsDefined(supportTicketCloseIm.CloseReason) ||
+            supportTicketCloseIm.CloseReason == SupportTicketCloseReason.ClosedByRequester)
             throw new FasApiErrorException("Invalid close reason", 400);
 
         if (supportTicket.Status == SupportTicketStatus.Closed)
@@ -308,20 +391,20 @@ public class SupportTicketService : ISupportTicketService
 
     public SupportTicketVm Reopen(SupportTicketReopenIm supportTicketReopenIm)
     {
+        // Desk only, like the rest of the desk closure endpoint. A requester whose ticket was closed
+        // raises a new one; letting them reopen would undo spam and duplicate closures.
+        _supportTicketDeskAccess.CheckDeskAccess();
         var supportTicket = _supportTicketWriter.GetOrThrow(supportTicketReopenIm.SupportTicketGuid);
         var currentUser = _aspCurrentUserService.GetCurrentUser();
-        var isDeskUser = _supportTicketDeskAccess.IsDeskUser();
-
-        if (currentUser == null || (!isDeskUser && supportTicket.RequesterGuid != currentUser.Guid))
-            throw new FasApiErrorException("This ticket belongs to somebody else", 403);
 
         if (!IsFinished(supportTicket))
             throw new FasApiErrorException("Only a closed ticket can be reopened", 400);
 
+        var previousStatus = supportTicket.Status;
         var now = DateTime.UtcNow;
         _supportTicketWoRepo.UpdateData(x => x.Guid == supportTicket.Guid, x =>
         {
-            x.Status = isDeskUser ? SupportTicketStatus.Open : SupportTicketStatus.WaitingForAgent;
+            x.Status = SupportTicketStatus.Open;
             x.ClosedUtc = null;
             x.ResolvedUtc = null;
             x.CloseReason = null;
@@ -336,28 +419,32 @@ public class SupportTicketService : ISupportTicketService
             _supportTicketWriter.AppendMessage(_supportTicketWriter.GetOrThrow(supportTicket.Guid),
                 new SupportTicketMessageCommand
                 {
-                    Direction = isDeskUser
-                        ? SupportTicketMessageDirection.InternalNote
-                        : SupportTicketMessageDirection.Inbound,
-                    AuthorGuid = currentUser.Guid,
-                    AuthorName = currentUser.DisplayName,
-                    AuthorEmail = currentUser.Email,
+                    Direction = SupportTicketMessageDirection.InternalNote,
+                    AuthorGuid = currentUser?.Guid,
+                    AuthorName = currentUser?.DisplayName,
+                    AuthorEmail = currentUser?.Email,
                     Body = supportTicketReopenIm.Message
                 });
         }
 
         _supportTicketWriter.LogEvent(supportTicket.Guid, SupportTicketEventTypes.Reopened,
-            SupportTicketStatus.Closed.ToString(), null, currentUser.Guid, currentUser.DisplayName);
-        return _supportTicketViewMapper.ToDetails(_supportTicketWriter.GetOrThrow(supportTicket.Guid), isDeskUser);
+            previousStatus.ToString(), null, currentUser?.Guid, currentUser?.DisplayName);
+        return _supportTicketViewMapper.ToDetails(_supportTicketWriter.GetOrThrow(supportTicket.Guid), true);
     }
 
     private static bool IsFinished(SupportTicket supportTicket) =>
         supportTicket.Status is SupportTicketStatus.Resolved or SupportTicketStatus.Closed;
 
+    /// <summary>What the message will weigh: the HTML when there is one, as SupportTicketRichText picks.</summary>
+    private static int ContentLength(string body, string html) =>
+        string.IsNullOrWhiteSpace(html) ? body?.Length ?? 0 : html.Length;
+
     private SupportTicketPerson ResolveRequester(SupportTicketIm supportTicketIm, CurrentUser currentUser,
-        bool isDeskUser)
+        bool fromDesk)
     {
-        if (isDeskUser && !string.IsNullOrWhiteSpace(supportTicketIm.RequesterEmail))
+        // Only the desk path (desk access already checked) files a ticket for somebody else; the
+        // requester path identifies the requester from the session, whoever is signed in.
+        if (fromDesk && !string.IsNullOrWhiteSpace(supportTicketIm.RequesterEmail))
         {
             var email = SupportTicketInputValidation.Trim(supportTicketIm.RequesterEmail, SupportTicketContentLimits.Email);
             if (!SupportTicketInputValidation.IsEmailAddress(email))

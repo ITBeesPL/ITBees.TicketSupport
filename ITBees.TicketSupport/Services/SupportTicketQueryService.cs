@@ -132,8 +132,10 @@ public class SupportTicketQueryService : ISupportTicketQueryService
     private PaginatedResult<SupportTicketListItemVm> Paginate(IQueryable<SupportTicket> query,
         SupportTicketListFilter filter)
     {
-        var page = filter.Page < 1 ? 1 : filter.Page;
         var pageSize = filter.PageSize is < 1 or > 200 ? 25 : filter.PageSize;
+        // Skip takes an int: a huge page number would overflow into a negative offset and a database
+        // error instead of an empty page.
+        var page = Math.Clamp(filter.Page, 1, int.MaxValue / pageSize);
 
         var allElements = query.Count();
         var ordered = ApplySort(query, filter);

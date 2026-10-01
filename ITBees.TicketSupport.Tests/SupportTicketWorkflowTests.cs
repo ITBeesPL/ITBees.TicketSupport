@@ -27,11 +27,34 @@ public class SupportTicketWorkflowTests
     private List<SupportTicketContextVm> _contexts = null!;
     private Mock<IAspCurrentUserService> _currentUser = null!;
     private Mock<ISupportTicketDeskAccess> _desk = null!;
+    private Mock<ISupportTicketRequesterResolver> _resolver = null!;
     private SupportTicketService _service = null!;
     private SupportTicketQueryService _query = null!;
     private SupportTicketRequesterClosureService _closureService = null!;
     private SupportTicketStatisticsService _statistics = null!;
     private CurrentUser _requester = null!;
+    private SupportTicketWriter _writer = null!;
+    private SupportTicketViewMapper _mapper = null!;
+    private SupportTicketRequesterAccess _requesterAccess = null!;
+    private readonly List<InMemorySupportTicketRateLimiter> _rateLimiters = new();
+
+    [TearDown]
+    public void TearDown()
+    {
+        _rateLimiters.ForEach(x => x.Dispose());
+        _rateLimiters.Clear();
+    }
+
+    private InMemorySupportTicketRateLimiter Limiter(SupportTicketRateLimitConfiguration rateLimits)
+    {
+        var limiter = new InMemorySupportTicketRateLimiter(new SupportTicketConfiguration { RateLimits = rateLimits });
+        _rateLimiters.Add(limiter);
+        return limiter;
+    }
+
+    private SupportTicketService NewService(ISupportTicketRateLimiter rateLimiter) =>
+        new(_tickets.Write.Object, _writer, _mapper, _desk.Object, _resolver.Object, _ratingService,
+            Mock.Of<ISupportTicketNotifier>(), _currentUser.Object, _requesterAccess, rateLimiter);
 
     [SetUp]
     public void Setup()
@@ -47,23 +70,23 @@ public class SupportTicketWorkflowTests
         contextAccess.Setup(x => x.CheckAccess(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
             .Returns((string type, Guid guid, bool _) => _contexts.FirstOrDefault(x => x.Type == type && x.Guid == guid)
                 ?? throw new FasApiErrorException("Context forbidden", 403));
-        var requesterAccess = new SupportTicketRequesterAccess(_currentUser.Object, contextAccess.Object);
+        var requesterAccess = _requesterAccess = new SupportTicketRequesterAccess(_currentUser.Object, contextAccess.Object);
         _desk.Setup(x => x.CheckDeskAccess()).Callback(() =>
         {
             if (!_desk.Object.IsDeskUser()) throw new FasApiErrorException("Forbidden", 403);
         });
-        var resolver = new Mock<ISupportTicketRequesterResolver>();
+        var resolver = _resolver = new Mock<ISupportTicketRequesterResolver>();
         resolver.Setup(x => x.ResolveNames(It.IsAny<IReadOnlyCollection<Guid>>())).Returns(new Dictionary<Guid, string>());
-        var writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
-            _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
-        var mapper = new SupportTicketViewMapper(_messages.Read.Object, _attachments.Read.Object, _ratings.Read.Object,
+        var writer = _writer = new SupportTicketWriter(_tickets.Write.Object, _tickets.Read.Object, _messages.Write.Object,
+            _messages.Read.Object, _events.Write.Object, Mock.Of<ISupportTicketNumberGenerator>(x => x.Next() == 100001), NullLogger<SupportTicketWriter>.Instance);
+        var mapper = _mapper = new SupportTicketViewMapper(_messages.Read.Object, _attachments.Read.Object, _ratings.Read.Object,
             _events.Read.Object, resolver.Object);
         _ratingService = new SupportTicketRatingService(_ratings.Read.Object, _ratings.Write.Object,
             Mock.Of<ISupportTicketNotifier>(), writer, new SupportTicketConfiguration());
         _requesterRatingService = new SupportTicketRequesterRatingService(_tickets.Read.Object, _currentUser.Object,
             _ratingService, mapper, requesterAccess);
-        _service = new SupportTicketService(_tickets.Write.Object, writer, mapper, _desk.Object, resolver.Object,
-            _ratingService, Mock.Of<ISupportTicketNotifier>(), _currentUser.Object, requesterAccess);
+        // The default limits, which none of the workflow tests should come near.
+        _service = NewService(Limiter(new SupportTicketRateLimitConfiguration()));
         _query = new SupportTicketQueryService(_tickets.Read.Object, _events.Read.Object, _desk.Object,
             resolver.Object, mapper, _currentUser.Object, requesterAccess);
         _closureService = new SupportTicketRequesterClosureService(_tickets.Write.Object, writer, mapper, requesterAccess,
@@ -86,6 +109,46 @@ public class SupportTicketWorkflowTests
             Assert.That(result.Messages.Single().BodyHtml, Does.Contain("<table>").And.Contain("data:image/png"));
             Assert.That(result.Events.Single().EventType, Is.EqualTo(SupportTicketEventTypes.Created));
         });
+    }
+
+    [Test]
+    public void DeskUserOnTheRequesterEndpointFilesUnderOwnIdentity()
+    {
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var result = _service.Create(new SupportTicketIm
+            { Subject = "Awaria", Message = "Brama", RequesterEmail = "somebody@example.test", RequesterName = "Somebody" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.RequesterGuid, Is.EqualTo(_requester.Guid));
+            Assert.That(result.RequesterEmail, Is.EqualTo(_requester.Email));
+            Assert.That(result.Channel, Is.EqualTo(SupportTicketChannel.Panel));
+        });
+        _resolver.Verify(x => x.ResolveByEmail(It.IsAny<string>()), Times.Never);
+    }
+
+    [Test]
+    public void DeskEntersATicketForSomebodyElse()
+    {
+        var caller = new SupportTicketPerson { Guid = Guid.NewGuid(), Email = "caller@example.test", DisplayName = "Caller" };
+        _resolver.Setup(x => x.ResolveByEmail("caller@example.test")).Returns(caller);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var result = _service.CreateFromDesk(new SupportTicketIm
+            { Subject = "Telefon", Message = "Nie działa brama", RequesterEmail = " caller@example.test " });
+        Assert.Multiple(() =>
+        {
+            Assert.That(result.RequesterGuid, Is.EqualTo(caller.Guid));
+            Assert.That(result.RequesterEmail, Is.EqualTo(caller.Email));
+            Assert.That(result.Channel, Is.EqualTo(SupportTicketChannel.Phone));
+        });
+    }
+
+    [Test]
+    public void OnlyTheDeskEntersTicketsForSomebodyElse()
+    {
+        Assert.Throws<FasApiErrorException>(() => _service.CreateFromDesk(new SupportTicketIm
+            { Subject = "Telefon", Message = "Brama", RequesterEmail = "victim@example.test" }));
+        Assert.That(_tickets.Rows, Is.Empty);
+        _resolver.Verify(x => x.ResolveByEmail(It.IsAny<string>()), Times.Never);
     }
 
     [Test]
@@ -135,32 +198,142 @@ public class SupportTicketWorkflowTests
     }
 
     [Test]
-    public void DeskReplyCloseAndRequesterReplyPreserveThreadAndClearClosureMetadata()
+    public void RequesterSeesTheNameButNotTheAddressOfTheSupportAccount()
+    {
+        var ticket = Create();
+        var requester = _requester;
+        _requester = new CurrentUser { Guid = Guid.NewGuid(), Email = "agent@example.test", DisplayName = "Agent" };
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        Assert.That(_query.GetDetails(ticket.Guid).Messages.Last().AuthorEmail, Is.EqualTo("agent@example.test"));
+
+        _requester = requester;
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        var messages = _query.GetDetails(ticket.Guid, true).Messages;
+        Assert.Multiple(() =>
+        {
+            Assert.That(messages.Last().AuthorName, Is.EqualTo("Agent"));
+            Assert.That(messages.Last().AuthorEmail, Is.Null);
+            Assert.That(messages.First().AuthorEmail, Is.EqualTo(requester.Email));
+        });
+    }
+
+    [Test]
+    public void DeskReplyAndCloseAreRecordedOnceAndTheRequesterCannotAnswerAClosedTicket()
     {
         var ticket = Create();
         _desk.Setup(x => x.IsDeskUser()).Returns(true);
         var reply = _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdziliśmy bramę" });
         Assert.That(reply.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
         Assert.That(reply.FirstResponseUtc, Is.Not.Null);
-        var closed = _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, CloseNote = "Naprawiono", AskForRating = false });
+        var closed = _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.Spam, CloseNote = "Naprawiono", AskForRating = false });
         Assert.That(closed.Status, Is.EqualTo(SupportTicketStatus.Closed));
         _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
         Assert.That(_events.Rows.Count(x => x.EventType == SupportTicketEventTypes.Closed), Is.EqualTo(1));
+
         _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        var refused = Assert.Throws<FasApiErrorException>(() => _service.ReplyAsRequester(
+            new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" }));
+        var row = _tickets.Rows.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(409));
+            Assert.That(row.Status, Is.EqualTo(SupportTicketStatus.Closed));
+            Assert.That(row.CloseReason, Is.EqualTo(SupportTicketCloseReason.Spam));
+            Assert.That(row.CloseNote, Is.EqualTo("Naprawiono"));
+            Assert.That(row.ClosedByGuid, Is.EqualTo(_requester.Guid));
+            Assert.That(row.ReopenCount, Is.Zero);
+            Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+            Assert.That(_events.Rows.Any(x => x.EventType == SupportTicketEventTypes.Reopened), Is.False);
+        });
+    }
+
+    [Test]
+    public void RequesterAnswerReopensAResolvedTicket()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdziliśmy bramę" });
+        _service.ChangeStatus(new SupportTicketStatusUm { SupportTicketGuid = ticket.Guid, Status = SupportTicketStatus.Resolved });
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+
         var reopened = _service.ReplyAsRequester(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" });
         Assert.Multiple(() =>
         {
             Assert.That(reopened.Status, Is.EqualTo(SupportTicketStatus.WaitingForAgent));
             Assert.That(reopened.ReopenCount, Is.EqualTo(1));
-            Assert.That(reopened.ClosedUtc, Is.Null);
-            Assert.That(reopened.ClosedByGuid, Is.Null);
-            Assert.That(reopened.CloseNote, Is.Null);
+            Assert.That(reopened.ResolvedUtc, Is.Null);
             Assert.That(reopened.Messages, Has.Count.EqualTo(3));
-            Assert.That(reopened.Events.Select(x => x.EventType), Does.Contain(SupportTicketEventTypes.Closed).And.Contain(SupportTicketEventTypes.Reopened));
+            Assert.That(reopened.Events.Select(x => x.EventType), Does.Contain(SupportTicketEventTypes.Reopened));
         });
     }
 
+    [Test]
+    public void OnlyTheDeskReopensAClosedTicket()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.Duplicate, CloseNote = "Zob. #100000", AskForRating = false });
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+
+        // The requester raised it, but the reopen endpoint belongs to the desk.
+        Assert.Throws<FasApiErrorException>(() => _service.Reopen(new SupportTicketReopenIm
+            { SupportTicketGuid = ticket.Guid, Message = "To nie duplikat" }));
+        Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.Closed));
+        Assert.That(_tickets.Rows.Single().CloseNote, Is.EqualTo("Zob. #100000"));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(1));
+
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        var reopened = _service.Reopen(new SupportTicketReopenIm { SupportTicketGuid = ticket.Guid, Message = "Jednak nie duplikat" });
+        Assert.Multiple(() =>
+        {
+            Assert.That(reopened.Status, Is.EqualTo(SupportTicketStatus.Open));
+            Assert.That(reopened.ReopenCount, Is.EqualTo(1));
+            Assert.That(reopened.CloseReason, Is.Null);
+            Assert.That(_messages.Rows.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.InternalNote));
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.Reopened));
+            Assert.That(_events.Rows.Last().FromValue, Is.EqualTo(nameof(SupportTicketStatus.Closed)));
+        });
+    }
+
+    [Test]
+    public void DeskCannotRecordItsClosureAsTheRequesters()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.Throws<FasApiErrorException>(() => _service.Close(new SupportTicketCloseIm
+            { SupportTicketGuid = ticket.Guid, CloseReason = SupportTicketCloseReason.ClosedByRequester }));
+        Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.New));
+        Assert.That(_events.Rows.Any(x => x.EventType == SupportTicketEventTypes.Closed), Is.False);
+    }
+
     private SupportTicketVm Create() => _service.Create(new SupportTicketIm { Subject = "Awaria", Message = "Brama nie działa" });
+
+    [Test]
+    public void ListsCountPublicMessagesWithoutLoadingThem()
+    {
+        var ticket = Create();
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        _service.AddInternalNote(new SupportTicketNoteIm { SupportTicketGuid = ticket.Guid, Message = "Wewnętrzne" });
+        _messages.Read.Invocations.Clear();
+
+        var queue = _query.GetForDesk(new SupportTicketListFilter());
+        Assert.That(queue.Data.Single().MessageCount, Is.EqualTo(2));
+        _messages.Read.Verify(x => x.GetData(It.IsAny<Expression<Func<SupportTicketMessage, bool>>>(),
+            It.IsAny<Expression<Func<SupportTicketMessage, object>>[]>()), Times.Never);
+    }
+
+    [Test]
+    public void AHugePageNumberGivesAnEmptyPage()
+    {
+        Create();
+        var page = _query.GetMine(new SupportTicketListFilter { Page = int.MaxValue, PageSize = 200 });
+        Assert.That(page.AllElementsCount, Is.EqualTo(1));
+        Assert.That(page.Data, Is.Empty);
+    }
 
     [Test]
     public void MysqlTimestampsAreSerializedAsUtc()
@@ -365,6 +538,28 @@ public class SupportTicketWorkflowTests
     }
 
     [Test]
+    public void ContextAdapterAnsweringNullOrAnotherContextIsADenial()
+    {
+        var contextGuid = Guid.NewGuid();
+        var adapter = new Mock<ISupportTicketContextAccess>();
+        var access = new SupportTicketRequesterAccess(_currentUser.Object, adapter.Object);
+        var shared = new SupportTicket
+            { Guid = Guid.NewGuid(), ContextType = "parking", ContextGuid = contextGuid, RequesterGuid = Guid.NewGuid() };
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>())).Returns((SupportTicketContextVm)null!);
+        Assert.Throws<FasApiErrorException>(() => access.Check(shared, false));
+        Assert.Throws<FasApiErrorException>(() => access.CheckContext("parking", contextGuid, true));
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>()))
+            .Returns(new SupportTicketContextVm("parking", Guid.NewGuid(), "Another parking"));
+        Assert.Throws<FasApiErrorException>(() => access.Check(shared, false));
+
+        adapter.Setup(x => x.CheckAccess("parking", contextGuid, It.IsAny<bool>()))
+            .Returns(new SupportTicketContextVm("Parking", contextGuid, "Test parking"));
+        Assert.DoesNotThrow(() => access.Check(shared, true));
+    }
+
+    [Test]
     public void DefaultContextAdapterDeniesSharedTickets()
     {
         var adapter = new PrivateSupportTicketContextAccess();
@@ -489,13 +684,19 @@ public class SupportTicketWorkflowTests
     {
         var ticket = Create();
         _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Root cause: loop 2 stuck", InternalNote = true });
+        {
+            SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Root cause: loop 2 stuck",
+            Kind = SupportTicketTrustedMessageKind.InternalNote
+        });
         var afterNote = _tickets.Rows.Single();
         Assert.That(afterNote.Status, Is.EqualTo(SupportTicketStatus.New));
         Assert.That(afterNote.FirstResponseUtc, Is.Null);
 
         var answered = _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Szlaban otworzył się po 3 s." });
+        {
+            SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Szlaban otworzył się po 3 s.",
+            Kind = SupportTicketTrustedMessageKind.Reply
+        });
         Assert.Multiple(() =>
         {
             Assert.That(answered.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
@@ -522,15 +723,222 @@ public class SupportTicketWorkflowTests
         _desk.Setup(x => x.IsDeskUser()).Returns(true);
         _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
         Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late" }));
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late", Kind = SupportTicketTrustedMessageKind.Reply }));
         Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, Message = "Nameless", InternalNote = true }));
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Too late for a draft too" }));
+        Assert.Throws<FasApiErrorException>(() => _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
+            { SupportTicketGuid = ticket.Guid, Message = "Nameless", Kind = SupportTicketTrustedMessageKind.InternalNote }));
         Assert.That(_messages.Rows, Has.Count.EqualTo(1));
 
         // A note on a finished ticket is still allowed - the desk may want the analysis on record.
         _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
-            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Post-mortem", InternalNote = true });
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = "Post-mortem", Kind = SupportTicketTrustedMessageKind.InternalNote });
         Assert.That(_tickets.Rows.Single().Status, Is.EqualTo(SupportTicketStatus.Closed));
+    }
+
+    private SupportTicketMessage Draft(SupportTicketVm ticket, string message = "Szlaban otworzył się po 3 s.")
+    {
+        // No Kind: the default has to be the draft.
+        _service.ReplyAsTrustedCaller(new SupportTicketTrustedReplyCommand
+            { SupportTicketGuid = ticket.Guid, AuthorName = "Octopark AI", Message = message });
+        return _messages.Rows.Last();
+    }
+
+    [Test]
+    public void TrustedCallerDraftsByDefaultAndTheRequesterSeesNothingUntilSupportPublishes()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        var row = _tickets.Rows.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+            Assert.That(draft.IsPublic, Is.False);
+            Assert.That(row.Status, Is.EqualTo(SupportTicketStatus.New));
+            Assert.That(row.FirstResponseUtc, Is.Null);
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftProposed));
+        });
+
+        var requesterView = _query.GetDetails(ticket.Guid, true);
+        Assert.That(requesterView.Messages, Has.Count.EqualTo(1));
+        Assert.That(requesterView.Events.Select(x => x.EventType), Does.Not.Contain(SupportTicketEventTypes.DraftProposed));
+        Assert.That(_query.GetMine(new SupportTicketListFilter()).Data.Single().MessageCount, Is.EqualTo(1));
+
+        var approver = new CurrentUser { Guid = Guid.NewGuid(), Email = "agent@example.test", DisplayName = "Agent" };
+        var requester = _requester;
+        _requester = approver;
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.That(_query.GetDetails(ticket.Guid).Messages.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+        var published = _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid });
+        Assert.Multiple(() =>
+        {
+            Assert.That(published.Status, Is.EqualTo(SupportTicketStatus.WaitingForCustomer));
+            Assert.That(published.FirstResponseUtc, Is.Not.Null);
+            Assert.That(published.Messages.Last().Direction, Is.EqualTo(SupportTicketMessageDirection.Outbound));
+            Assert.That(published.Messages.Last().AuthorName, Is.EqualTo("Octopark AI"));
+            Assert.That(_events.Rows.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftPublished));
+            Assert.That(_events.Rows.Last().ActorGuid, Is.EqualTo(approver.Guid));
+        });
+
+        _requester = requester;
+        _desk.Setup(x => x.IsDeskUser()).Returns(false);
+        Assert.That(_query.GetDetails(ticket.Guid, true).Messages.Last().Body, Is.EqualTo("Szlaban otworzył się po 3 s."));
+
+        // Published once: a second click finds no draft.
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid }));
+    }
+
+    [Test]
+    public void OnlyTheDeskPublishesOrDiscardsADraft()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        var im = new SupportTicketDraftIm { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid };
+
+        Assert.Throws<FasApiErrorException>(() => _service.PublishDraft(im));
+        Assert.Throws<FasApiErrorException>(() => _service.DiscardDraft(im));
+        Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void DiscardedDraftIsGoneAndOnlyDraftsCanBePublished()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+
+        // The requester's own message and a note are not drafts, and a draft of another ticket is not this one's.
+        var other = Create();
+        var otherDraft = Draft(other);
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = _messages.Rows.First().Guid }));
+        Assert.Throws<ResultNotFoundException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = otherDraft.Guid }));
+
+        var discarded = _service.DiscardDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid });
+        Assert.Multiple(() =>
+        {
+            Assert.That(_messages.Rows.Any(x => x.Guid == draft.Guid), Is.False);
+            Assert.That(discarded.Messages, Has.Count.EqualTo(1));
+            Assert.That(discarded.Events.Last().EventType, Is.EqualTo(SupportTicketEventTypes.DraftDiscarded));
+            Assert.That(_tickets.Rows.First(x => x.Guid == ticket.Guid).Status, Is.EqualTo(SupportTicketStatus.New));
+        });
+    }
+
+    [Test]
+    public void ADraftCannotBePublishedOnAClosedTicket()
+    {
+        var ticket = Create();
+        var draft = Draft(ticket);
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        _service.Close(new SupportTicketCloseIm { SupportTicketGuid = ticket.Guid, AskForRating = false });
+
+        var refused = Assert.Throws<FasApiErrorException>(() => _service.PublishDraft(new SupportTicketDraftIm
+            { SupportTicketGuid = ticket.Guid, SupportTicketMessageGuid = draft.Guid }));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(409));
+        Assert.That(draft.Direction, Is.EqualTo(SupportTicketMessageDirection.DraftReply));
+    }
+
+    private static SupportTicketIm NewTicketIm(string message = "Brama nie działa") =>
+        new() { Subject = "Awaria", Message = message };
+
+    [Test]
+    public void RequesterIsStoppedAfterTheBurstOfNewTicketsTheDeskIsNot()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { NewTickets = new() { Burst = 2, Refill = 1, RefillPeriod = TimeSpan.FromHours(1) } }));
+        service.Create(NewTicketIm());
+        service.Create(NewTicketIm());
+
+        var refused = Assert.Throws<FasApiErrorException>(() => service.Create(NewTicketIm()));
+        Assert.Multiple(() =>
+        {
+            Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+            Assert.That(refused.FasApiErrorVm.ErrorKey, Is.EqualTo(InMemorySupportTicketRateLimiter.ErrorKey));
+            Assert.That(refused.Message, Does.Contain("Try again in 60 min"));
+            Assert.That(_tickets.Rows, Has.Count.EqualTo(2));
+        });
+
+        // Budgets are per requester, and the desk has none.
+        _requester = new CurrentUser { Guid = Guid.NewGuid(), Email = "coworker@example.test", DisplayName = "Coworker" };
+        service.Create(NewTicketIm());
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        for (var i = 0; i < 3; i++)
+            service.CreateFromDesk(NewTicketIm());
+        Assert.That(_tickets.Rows, Has.Count.EqualTo(6));
+    }
+
+    [Test]
+    public void RequesterAnswersAreLimitedTheDeskAnswersAreNot()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { Messages = new() { Burst = 2, Refill = 1, RefillPeriod = TimeSpan.FromMinutes(10) } }));
+        var ticket = service.Create(NewTicketIm());
+        var reply = new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Nadal nie działa" };
+        service.ReplyAsRequester(reply);
+        service.ReplyAsRequester(reply);
+
+        var refused = Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(reply));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+        Assert.That(_messages.Rows, Has.Count.EqualTo(3));
+
+        _desk.Setup(x => x.IsDeskUser()).Returns(true);
+        for (var i = 0; i < 3; i++)
+            service.ReplyAsAgent(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = "Sprawdzamy" });
+        Assert.That(_messages.Rows, Has.Count.EqualTo(6));
+    }
+
+    [Test]
+    public void ContentVolumeCountsNewTicketsAndAnswersTogether()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { ContentKilobytes = new() { Burst = 10, Refill = 10, RefillPeriod = TimeSpan.FromHours(1) } }));
+        var ticket = service.Create(NewTicketIm(new string('a', 6 * 1024)));
+
+        Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(new SupportTicketReplyIm
+            { SupportTicketGuid = ticket.Guid, Message = new string('b', 5 * 1024) }));
+        service.ReplyAsRequester(new SupportTicketReplyIm { SupportTicketGuid = ticket.Guid, Message = new string('c', 4 * 1024) });
+        Assert.That(_messages.Rows, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void AMessageLargerThanTheWholeContentBudgetTakesAFullBucketInsteadOfFailing()
+    {
+        var service = NewService(Limiter(new SupportTicketRateLimitConfiguration
+            { ContentKilobytes = new() { Burst = 4, Refill = 4, RefillPeriod = TimeSpan.FromHours(1) } }));
+        var ticket = service.Create(NewTicketIm(new string('a', 6 * 1024)));
+        var refused = Assert.Throws<FasApiErrorException>(() => service.ReplyAsRequester(new SupportTicketReplyIm
+            { SupportTicketGuid = ticket.Guid, Message = "Krótko" }));
+        Assert.That(refused!.FasApiErrorVm.StatusCode, Is.EqualTo(429));
+    }
+
+    [Test]
+    public void NullRateLimitsSwitchTheLimiterOff()
+    {
+        var service = NewService(Limiter(null!));
+        for (var i = 0; i < 30; i++)
+            service.Create(NewTicketIm());
+        Assert.That(_tickets.Rows, Has.Count.EqualTo(30));
+    }
+
+    [Test]
+    public void RateLimitNeedsPositiveValues() =>
+        Assert.Throws<ArgumentException>(() => Limiter(new SupportTicketRateLimitConfiguration
+            { Messages = new() { Burst = 0, Refill = 1, RefillPeriod = TimeSpan.FromMinutes(1) } }));
+
+    [Test]
+    public void TheRateLimiterIsOnePerProcess()
+    {
+        // A scoped limiter would start every request with full buckets and never refuse anything.
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        ITBees.TicketSupport.Setup.SupportTicketSetup.Register(services, new SupportTicketConfiguration());
+        Assert.That(services.Single(x => x.ServiceType == typeof(ISupportTicketRateLimiter)).Lifetime,
+            Is.EqualTo(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton));
     }
 
     private sealed class Store<T> where T : class
@@ -547,6 +955,8 @@ public class SupportTicketWorkflowTests
             Read.Setup(x => x.GetDataQueryable(It.IsAny<Expression<Func<T, bool>>>()))
                 .Returns((Expression<Func<T, bool>> predicate) => Rows.AsQueryable().Where(predicate));
             Write.Setup(x => x.InsertData(It.IsAny<T>())).Returns((T value) => { Rows.Add(value); return value; });
+            Write.Setup(x => x.DeleteData(It.IsAny<Expression<Func<T, bool>>>()))
+                .Returns((Expression<Func<T, bool>> predicate) => Rows.RemoveAll(new Predicate<T>(predicate.Compile())));
             Write.Setup(x => x.UpdateData(It.IsAny<Expression<Func<T, bool>>>(), It.IsAny<Action<T>>(), It.IsAny<Expression<Func<T, object>>[]>()))
                 .Returns((Expression<Func<T, bool>> predicate, Action<T> change, Expression<Func<T, object>>[] _) =>
                 {

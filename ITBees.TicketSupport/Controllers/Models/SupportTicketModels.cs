@@ -114,8 +114,9 @@ public class SupportTicketIm : RestIm
     public SupportTicketPriority? Priority { get; set; }
 
     /// <summary>
-    /// Only support staff may set these, and only for a ticket taken over the phone. A requester
-    /// filing their own ticket is identified from the session, never from the payload.
+    /// Read only by the desk endpoint (<c>ISupportTicketService.CreateFromDesk</c>), for a ticket taken
+    /// over the phone. A requester filing their own ticket is identified from the session, never from
+    /// the payload - even when the requester is support staff using the requester endpoint.
     /// </summary>
     public string RequesterEmail { get; set; }
 
@@ -134,6 +135,15 @@ public class SupportTicketNoteIm : RestIm
     public string MessageHtml { get; set; }
     public Guid SupportTicketGuid { get; set; }
     public string Message { get; set; }
+}
+
+/// <summary>A drafted answer the desk publishes or discards.</summary>
+public class SupportTicketDraftIm : RestIm
+{
+    public Guid SupportTicketGuid { get; set; }
+
+    /// <summary>The draft message, as the desk view of the ticket lists it.</summary>
+    public Guid SupportTicketMessageGuid { get; set; }
 }
 
 public class SupportTicketAssignUm : RestUm

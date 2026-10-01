@@ -8,4 +8,7 @@ public sealed class SupportTicketConfiguration
     public int LowRatingThreshold { get; init; } = 2;
 
     public SupportTicketLinkConfiguration Links { get; init; }
+
+    /// <summary>What one requester may post in a given time. On by default; null switches it off.</summary>
+    public SupportTicketRateLimitConfiguration RateLimits { get; init; } = new();
 }

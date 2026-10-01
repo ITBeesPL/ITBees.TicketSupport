@@ -53,10 +53,13 @@ public class SupportTicketViewMapper
             .GetData(x => guids.Contains(x.SupportTicketGuid) && x.Score != null)
             .ToDictionary(x => x.SupportTicketGuid, x => x.Score);
 
+        // Counted by the database. Loading the rows would pull every body - up to 8 MB of HTML each -
+        // into memory for every list page, so a requester posting large messages slowed the desk queue.
         var messageCounts = _supportTicketMessageRoRepo
-            .GetData(x => guids.Contains(x.SupportTicketGuid) && x.IsPublic)
+            .GetDataQueryable(x => guids.Contains(x.SupportTicketGuid) && x.IsPublic)
             .GroupBy(x => x.SupportTicketGuid)
-            .ToDictionary(x => x.Key, x => x.Count());
+            .Select(x => new { SupportTicketGuid = x.Key, Count = x.Count() })
+            .ToDictionary(x => x.SupportTicketGuid, x => x.Count);
 
         var assigneeNames = ResolveNames(supportTickets
             .Where(x => x.AssignedToGuid.HasValue)
@@ -97,6 +100,10 @@ public class SupportTicketViewMapper
             var messageVm = new SupportTicketMessageVm(x);
             if (string.IsNullOrWhiteSpace(messageVm.AuthorName) && x.AuthorGuid.HasValue)
                 messageVm.AuthorName = authorNames.GetValueOrDefault(x.AuthorGuid.Value);
+            // The address on a desk answer is the login of a support account; the requester side gets
+            // the name only.
+            if (!includeInternal && x.Direction != SupportTicketMessageDirection.Inbound)
+                messageVm.AuthorEmail = null;
             messageVm.Attachments = attachments
                 .Where(a => a.SupportTicketMessageGuid == x.Guid)
                 .Select(a => new SupportTicketAttachmentVm(a))
